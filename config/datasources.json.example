@@ -1,0 +1,168 @@
+{
+  "default_datasource": "main",
+  "heartbeat_interval_ms": 5000,
+  "pool": {
+    "enabled": true,
+    "min": 2,
+    "max": 10,
+    "borrow_timeout_ms": 30000,
+    "idle_timeout_ms": 600000,
+    "max_lifetime_ms": 1800000,
+    "leak_detection_threshold_ms": 30000
+  },
+  "retry": {
+    "max_attempts": 3,
+    "initial_backoff_ms": 50,
+    "max_backoff_ms": 500,
+    "retry_writes": false
+  },
+  "circuit_breaker": { "failure_threshold": 5, "open_interval_ms": 30000 },
+
+  "rate_limit": {
+    "enabled": false,
+    "global_qps": 0,
+    "per_fingerprint_qps": 0,
+    "burst": 0,
+    "fingerprint_mode": "off"
+  },
+
+  "sql_audit": {
+    "enabled": false,
+    "action": "warn",
+    "block_no_where_dml": false,
+    "require_limit_select": false,
+    "enforce_read_only": false,
+    "log_blocked": true,
+    "blacklist_fingerprints": [],
+    "whitelist_fingerprints": []
+  },
+
+  "query_cache": {
+    "enabled": false,
+    "ttl_ms": 60000,
+    "max_entries": 1000,
+    "max_memory_bytes": 0,
+    "cache_on_replica_only": false
+  },
+
+  "prepared_cache": {
+    "enabled": true,
+    "max_per_connection": 0
+  },
+
+  "observability": {
+    "sql_log": {
+      "enabled": false,
+      "mode": "template",
+      "level": "debug",
+      "log_success": true,
+      "log_errors": true,
+      "slow_only": false,
+      "sample_rate": 1.0,
+      "max_sql_length": 8192,
+      "max_param_length": 256,
+      "include_string_values": false,
+      "include_blob_values": false
+    },
+    "slow_sql": {
+      "enabled": true,
+      "threshold_ms": 500,
+      "aggregate_capacity": 1000,
+      "recent_capacity": 200,
+      "retain_rendered_sql": false,
+      "max_sql_length": 4096,
+      "histogram_buckets_ms": [10, 50, 100, 200, 500, 1000, 3000, 10000]
+    },
+    "pool_metrics": { "enabled": true },
+    "stats_report": {
+      "enabled": true,
+      "interval_ms": 60000,
+      "file": "logs/dbmw_stats.log",
+      "format": "text",
+      "include_pool": true,
+      "include_slow_sql": true,
+      "slow_sql_limit": 10
+    }
+  },
+
+  "datasources": [
+    {
+      "name": "main",
+      "type": "mysql",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "root",
+      "password": "pwd",
+      "database": "test",
+      "connection_timeout_ms": 5000,
+      "query_timeout_ms": 30000
+    },
+    {
+      "name": "main_standby",
+      "type": "mysql",
+      "host": "127.0.0.1",
+      "port": 3307,
+      "user": "root",
+      "password": "pwd",
+      "database": "test",
+      "connection_timeout_ms": 5000
+    },
+    {
+      "name": "pg",
+      "type": "postgres",
+      "host": "127.0.0.1",
+      "port": 5432,
+      "user": "postgres",
+      "password": "pwd",
+      "database": "test",
+      "max_result_rows": 50000
+    },
+    {
+      "name": "replica_1",
+      "type": "mysql",
+      "host": "127.0.0.1",
+      "port": 3308,
+      "user": "ro",
+      "password": "pwd",
+      "database": "test"
+    },
+    {
+      "name": "mssql",
+      "type": "odbc",
+      "dsn": "MSSQL",
+      "user": "sa",
+      "password": "pwd"
+    }
+  ],
+
+  "groups": [
+    {
+      "name": "app",
+      "primary": "main",
+      "replicas": [
+        { "name": "replica_1", "weight": 2 }
+      ],
+      "read_after_write_ms": 1000,
+      "fallback_to_primary": true,
+      "read_only": false,
+      "failover": {
+        "primaries": ["main_standby"],
+        "require_healthy": false,
+        "write_buffer": {
+          "enabled": false,
+          "max_queue": 1000,
+          "ttl_ms": 30000,
+          "flush_interval_ms": 1000
+        }
+      }
+    },
+    {
+      "name": "reporting",
+      "primary": "pg",
+      "replicas": [],
+      "read_after_write_ms": 0,
+      "fallback_to_primary": false,
+      "read_only": true
+    }
+  ]
+}

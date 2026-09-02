@@ -1,0 +1,2 @@
+add_executable(dbmw_example_basic basic_usage.cpp)
+target_link_libraries(dbmw_example_basic PRIVATE dbmw)

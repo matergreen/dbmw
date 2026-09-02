@@ -1,0 +1,28 @@
+# 构建产物
+build/
+cmake-build-*/
+out/
+
+# 目标文件 / 库
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+
+# IDE
+.idea/
+*.user
+
+# 编辑器
+*.swp
+*~
+.vscode/
+
+# 日志
+*.log
+
+# 第三方依赖（vendored 头除外，需纳入版本管理）
+third_party/*/build/
+.workbuddy
