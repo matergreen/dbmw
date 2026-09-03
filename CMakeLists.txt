@@ -112,7 +112,11 @@ if(DBMW_ENABLE_POSTGRES)
     target_compile_definitions(dbmw PRIVATE DBMW_ENABLE_POSTGRES)
     find_path(PQXX_INCLUDE_DIR NAMES pqxx/pqxx)
     find_library(PQXX_LIBRARY   NAMES pqxx)
-    find_path(PQ_INCLUDE_DIR    NAMES libpq-fe.h PATH_SUFFIXES postgresql)
+    # Homebrew 把 libpq-fe.h 直接装在 <prefix>/include/，而 Ubuntu/Debian 的
+    # libpq-dev 装在 <prefix>/include/postgresql/，两者布局不同。这里两种路径
+    # 都列上，避免 macOS 上 find_path 找不到而 FATAL_ERROR。dbmw 自身不直接
+    # include libpq-fe.h（走 pqxx 封装），该变量主要用于"已安装"的守卫判断。
+    find_path(PQ_INCLUDE_DIR    NAMES postgresql/libpq-fe.h libpq-fe.h)
     find_library(PQ_LIBRARY     NAMES pq)
     if(NOT PQXX_INCLUDE_DIR OR NOT PQXX_LIBRARY OR NOT PQ_LIBRARY)
         message(FATAL_ERROR "DBMW_ENABLE_POSTGRES=ON but libpqxx/libpq not found. "
