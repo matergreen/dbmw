@@ -141,32 +141,36 @@ namespace dbmw::driver {
         static constexpr pqxx::oid kFloat8 = 701;   // double precision
 
         // 将 libpqxx 字段转换为 dbmw 的通用 Value。
-        common::Value fieldToValue(const pqxx::field &f) {
+        // libpqxx 7 的行迭代器解引用为 pqxx::field，8.x 则改成了
+        // pqxx::field_ref。两者提供相同的只读字段接口，用模板同时接收，
+        // 避免把 8.x 的轻量引用强行绑定到 pqxx::field const&。
+        template<typename Field>
+        common::Value fieldToValue(const Field &f) {
             using common::Value;
             if (f.is_null()) return Value{nullptr};
             try {
                 switch (f.type()) {
-                    case kBool:   return Value{f.as<bool>()};
+                    case kBool:   return Value{f.template as<bool>()};
                     case kInt2:
-                    case kInt4:   return Value{static_cast<std::int64_t>(f.as<int>())};
-                    case kInt8:   return Value{static_cast<std::int64_t>(f.as<long long>())};
+                    case kInt4:   return Value{static_cast<std::int64_t>(f.template as<int>())};
+                    case kInt8:   return Value{static_cast<std::int64_t>(f.template as<long long>())};
                     case kFloat4:
-                    case kFloat8: return Value{f.as<double>()};
-                    case kNumeric:return Value{f.as<std::string>()};
-                    case kBytea:  return Value{parseBytea(f.as<std::string>())};
+                    case kFloat8: return Value{f.template as<double>()};
+                    case kNumeric:return Value{f.template as<std::string>()};
+                    case kBytea:  return Value{parseBytea(f.template as<std::string>())};
                     case kDate:
                     case kTimestamp:
                     case kTimestamptz: {
-                        const std::string s = f.as<std::string>();
+                        const std::string s = f.template as<std::string>();
                         common::Timestamp ts{};
                         if (common::tryParseTimestamp(s, ts)) return Value{ts};
                         return Value{s}; // 解析失败不丢数据，退化为字符串
                     }
-                    default:      return Value{f.as<std::string>()};
+                    default:      return Value{f.template as<std::string>()};
                 }
             } catch (...) {
                 // 转换失败时回退为字符串，保证不丢数据。
-                return Value{f.as<std::string>()};
+                return Value{f.template as<std::string>()};
             }
         }
 

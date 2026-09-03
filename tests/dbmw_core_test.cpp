@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -582,7 +583,8 @@ int main() {
 
     std::cout << "== 20. 安全配置：环境变量密码与热加载清理 ==\n";
     {
-        const std::string path = "/tmp/dbmw_config_loader_test.json";
+        const std::string path =
+            (std::filesystem::temp_directory_path() / "dbmw_config_loader_test.json").string();
 #ifdef _WIN32
         (void)_putenv_s("DBMW_TEST_PASSWORD", "from-env");
 #else
@@ -1119,7 +1121,8 @@ int main() {
 
     std::cout << "== 37. 可观测配置：解析、边界校验与物理池列表 ==\n";
     {
-        const std::string path = "/tmp/dbmw_observability_test.json";
+        const std::string path =
+            (std::filesystem::temp_directory_path() / "dbmw_observability_test.json").string();
         {
             std::ofstream file(path);
             file << R"({
