@@ -1056,7 +1056,7 @@ int main() {
 
         rs.clear();
         ds.query("SELECT * FROM users WHERE name=? AND id=?",
-                 {std::string("Bob"), std::int64_t(7)}, rs);
+                 common::Params{std::string("Bob"), std::int64_t(7)}, rs);
         const auto aggregates = common::Observability::slowSqlStats();
         const auto recent = common::Observability::recentSlowSql();
         check(aggregates.size() == 1 && aggregates.front().count == 2 &&
@@ -1068,7 +1068,7 @@ int main() {
               "最近慢 SQL 按时间倒序保留配置允许的完整 SQL");
         rs.clear();
         ds.query("SELECT $$literal ?$$ AS marker, ? AS value",
-                 {std::int64_t(9)}, rs);
+                 common::Params{std::int64_t(9)}, rs);
         check(captured.renderedSql ==
               "SELECT $$literal ?$$ AS marker, 9 AS value",
               "PostgreSQL dollar-quoted 文本里的问号不会被误当作占位符");
@@ -1077,7 +1077,8 @@ int main() {
         common::Observability::configure(observability);
         common::Observability::clearSlowSqlStats();
         rs.clear();
-        ds.query("SELECT * FROM users WHERE token=?", {std::string("secret-token")}, rs);
+        ds.query("SELECT * FROM users WHERE token=?",
+                 common::Params{std::string("secret-token")}, rs);
         const auto redacted = common::Observability::recentSlowSql();
         check(redacted.size() == 1 && redacted.front().renderedSql.find("secret-token") ==
               std::string::npos && redacted.front().renderedSql.find("<redacted>") !=

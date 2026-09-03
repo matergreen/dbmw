@@ -83,7 +83,7 @@ jobs:
         run: |
           p="$(brew --prefix)"
           for formula in mysql-client libpq libpqxx unixodbc; do
-            if d="$(brew --prefix "$formula" 2>/dev/null)"; then p="$p;$d"; fi
+            if d="$(brew --prefix "$formula" 2>/dev/null)"; then p="$p:$d"; fi
           done
           echo "CMAKE_PREFIX_PATH=$p" >> "$GITHUB_ENV"
 
