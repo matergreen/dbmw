@@ -1,7 +1,7 @@
-prefix="@CMAKE_INSTALL_PREFIX@"
+prefix="@_pc_prefix_expr@"
 exec_prefix="${prefix}"
-libdir="${prefix}/@CMAKE_INSTALL_LIBDIR@"
-includedir="${prefix}/@CMAKE_INSTALL_INCLUDEDIR@"
+libdir="@_pc_libdir_expr@"
+includedir="@_pc_includedir_expr@"
 
 Name: dbmw
 Description: C++17 database middleware - pooled connections, heartbeat, multi-driver (MySQL/PostgreSQL/ODBC)

@@ -152,7 +152,9 @@ endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-install(TARGETS dbmw nlohmann_json
+# 注意：nlohmann_json 已在上面第 63 行加入 dbmwTargets 导出集，这里不能再列一次，
+# 否则 install(EXPORT) 报 "includes target nlohmann_json more than once in the export set"。
+install(TARGETS dbmw
         EXPORT dbmwTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -178,6 +180,29 @@ install(EXPORT dbmwTargets
         DESTINATION "${_dbmw_cmake_dir}")
 
 # pkg-config（非 CMake 用户）：g++ main.cpp $(pkg-config --cflags --libs dbmw)
+#
+# prefix 用 pkg-config 内置变量 ${pcfiledir}（展开为 .pc 自身所在目录）推回安装前缀，
+# 而不是写死 @CMAKE_INSTALL_PREFIX@——后者在 configure 阶段就被定死，
+# 用 --install --prefix <dir> 打出来的包里 .pc 仍指向 /usr/local，解压到别处就失效。
+# CMAKE_INSTALL_LIBDIR 为绝对路径时无法用 ${pcfiledir} 反推，退回硬编码。
+if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}" OR IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+    set(_pc_prefix_expr    "${CMAKE_INSTALL_PREFIX}")
+    set(_pc_libdir_expr    "${CMAKE_INSTALL_LIBDIR}")
+    set(_pc_includedir_expr "${CMAKE_INSTALL_INCLUDEDIR}")
+else()
+    # .pc 位于 <prefix>/<LIBDIR>/pkgconfig，故需向上回退 (LIBDIR 层级数 + 1) 级到 prefix：
+    #   lib                  -> 1 层 -> ${pcfiledir}/../..
+    #   lib/x86_64-linux-gnu -> 2 层 -> ${pcfiledir}/../../..
+    string(REPLACE "/" ";" _pc_libdir_parts "${CMAKE_INSTALL_LIBDIR}")
+    list(LENGTH _pc_libdir_parts _pc_libdir_depth)
+    set(_pc_up "..")
+    foreach(_i RANGE 1 ${_pc_libdir_depth})
+        string(APPEND _pc_up "/..")
+    endforeach()
+    set(_pc_prefix_expr     "\${pcfiledir}/${_pc_up}")
+    set(_pc_libdir_expr     "${_pc_prefix_expr}/${CMAKE_INSTALL_LIBDIR}")
+    set(_pc_includedir_expr "${_pc_prefix_expr}/${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/dbmw.pc.in"
                "${CMAKE_CURRENT_BINARY_DIR}/dbmw.pc" @ONLY)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/dbmw.pc"
