@@ -1590,10 +1590,17 @@ namespace dbmw::core {
         std::atomic<bool> timedOut{false};
         std::atomic<bool> cancelDelivered{false};
         std::thread watcher;
-        if (options.timeout > std::chrono::milliseconds(0)) {
+        // 截止时间必须由执行回调的线程预先确定。若在线程函数里调用
+        // wait_for(timeout)，新线程迟迟得不到调度时计时会从它真正启动后才开始，
+        // 使 20ms 之类的短超时在繁忙 runner 上被静默放宽甚至完全漏掉。
+        const bool hasDeadline = options.timeout > std::chrono::milliseconds(0);
+        const auto deadline = hasDeadline
+            ? std::chrono::steady_clock::now() + options.timeout
+            : std::chrono::steady_clock::time_point::max();
+        if (hasDeadline) {
             watcher = std::thread([&] {
                 std::unique_lock<std::mutex> lock(deadlineMutex);
-                if (!deadlineCv.wait_for(lock, options.timeout, [&] { return finished; })) {
+                if (!deadlineCv.wait_until(lock, deadline, [&] { return finished; })) {
                     timedOut.store(true);
                     lock.unlock();
                     // 看门狗线程：这里绝不能让异常逃逸，否则 std::terminate
@@ -1610,6 +1617,10 @@ namespace dbmw::core {
         }
 
         auto operationStatus = runGuarded(s, fn);
+        // 即使看门狗线程直到回调结束后才获得调度，主线程仍按同一个绝对
+        // deadline 补判，保证“整体期限”不依赖操作系统的线程调度时机。
+        if (hasDeadline && std::chrono::steady_clock::now() >= deadline)
+            timedOut.store(true);
         {
             std::lock_guard<std::mutex> lock(deadlineMutex);
             finished = true;
