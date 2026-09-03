@@ -19,6 +19,14 @@
 
 
 namespace dbmw::driver {
+#ifdef DBMW_ENABLE_POSTGRES
+    // 事务类型别名：libpqxx 8.0 删除了 pqxx::work，而 7.x 里它本就只是
+    //     using work = transaction<>;
+    // transaction 的默认模板参数（read_committed + read_write）在 7.x 与 8.x 上
+    // 完全一致，因此写成 pqxx::transaction<> 即可同时覆盖 7.8 ~ 8.x。
+    using PgTx = pqxx::transaction<>;
+#endif
+
     // PostgreSQL 连接（libpqxx）。完整实现见 postgres_driver.cpp，
     // 由 DBMW_ENABLE_POSTGRES 控制是否参与真实编译（否则仅返回 DriverDisabled）。
     class PostgresConnection : public core::IDatabaseConnection {
@@ -102,7 +110,7 @@ namespace dbmw::driver {
 
         bool isOpen() const override { return open_; }
 
-        // 与 executeBatch / begin 的自建 pqxx::work 判定保持一致。
+        // 与 executeBatch / begin 的自建事务（PgTx）判定保持一致。
         [[nodiscard]] bool inTransaction() const override {
 #ifdef DBMW_ENABLE_POSTGRES
             return tx_ != nullptr;
@@ -135,7 +143,7 @@ namespace dbmw::driver {
         bool operationActive_ = false;
 #ifdef DBMW_ENABLE_POSTGRES
         std::unique_ptr<pqxx::connection> conn_;
-        std::unique_ptr<pqxx::work> tx_; // 活跃事务：begin() 之后、commit()/rollback() 之前
+        std::unique_ptr<PgTx> tx_; // 活跃事务：begin() 之后、commit()/rollback() 之前
 #endif
     };
 

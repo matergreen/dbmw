@@ -12,9 +12,19 @@
 #ifdef DBMW_ENABLE_POSTGRES
 #include <pqxx/pqxx>
 
-// libpqxx 7.10 新增了 exec(query, params) 重载，同时把 exec_params() 标记为废弃；
-// 7.9 及更早则只有 exec_params()。用一个内部宏记录"新 API 是否可用"，
-// 供下面的 execParams() 做版本分派。
+// libpqxx 的版本差异比想象中大，本文件按下面三档做兼容（7.8 ~ 8.x 通吃）：
+//
+//   1) exec(query, params) 与 pqxx::prepped：7.10 才引入，7.9 及更早只有
+//      exec_params() / exec_prepared()。用下面的宏记录"新 API 是否可用"，
+//      供 execParams() / execPrepared() 做版本分派（否则老版本会退化出一堆
+//      废弃告警，新版本又编不过）。
+//
+//   2) pqxx::work 别名：8.0 已删除。7.x 里它本就等价于 transaction<>，
+//      因此统一改用 PgTx（见 postgres_driver.h），两端语义一致。
+//
+//   3) C++ 标准：8.0 起要求 C++20（7.x 只需 C++17）。由 CMakeLists.txt
+//      探测 libpqxx 版本后对 dbmw 目标单独提标，见那里的注释。
+//
 // 拆成两层 #if 是为了避免 -Wundef：内层对版本号的比较只在宏确实已定义时才会被求值。
 #if defined(PQXX_VERSION_MAJOR) && defined(PQXX_VERSION_MINOR)
 #  if (PQXX_VERSION_MAJOR > 7) || (PQXX_VERSION_MAJOR == 7 && PQXX_VERSION_MINOR >= 10)
@@ -233,6 +243,23 @@ namespace dbmw::driver {
 #endif
         }
 
+        // 执行已预备语句（prepared statement）。版本分派的原因与 execParams 相同：
+        // pqxx::prepped 和 exec(..., params) 都是 7.10 才有的，更早的版本只能退回
+        // exec_prepared(zview, ...)。
+        //
+        // exec_prepared 是变参模板，会把实参逐个 append 进它内部的 params；而
+        // pqxx::params 自带 append(params const&) / append(params&&) 重载（7.8 起
+        // 就有，libpqxx 文档明确支持"把 params 塞进 params"），所以把已经组装好的
+        // parms 整体传进去，语义与 exec(prepped, params) 完全等价。
+        pqxx::result execPrepared(pqxx::transaction_base &tx, const std::string &name,
+                                  pqxx::params &parms) {
+#if defined(DBMW_PQXX_HAS_EXEC_WITH_PARAMS)
+            return tx.exec(pqxx::prepped{name}, std::move(parms));
+#else
+            return tx.exec_prepared(pqxx::zview{name}, std::move(parms));
+#endif
+        }
+
         common::Status streamRows(pqxx::transaction_base &tx, const std::string &sql,
                                   const common::Params &params,
                                   const common::RowCallback &callback,
@@ -278,7 +305,7 @@ namespace dbmw::driver {
     //   - 调用方已开事务（tx_ 非空，典型为 Session::openCursor 的 BorrowedInSession）：
     //     借用现有事务，close 只关游标、不动事务（事务归 Session 管）。
     //   - 调用方未开事务且 auto_transaction=true（典型为 DataSource::openCursor 的
-    //     独立游标）：自建一个 pqxx::work 兜底，游标生命周期托管该事务，close/析构
+    //     独立游标）：自建一个 PgTx 兜底，游标生命周期托管该事务，close/析构
     //     时提交它。这样连接钉住到游标关闭为止，符合“借→钉住→取 N 次→显式关→还”。
     // auto_transaction=false 且没开事务：PG 无法开游标，直接报错（不静默降级，
     // 否则调用方会以为拿到游标）。
@@ -294,7 +321,7 @@ namespace dbmw::driver {
                 tx_ = owner_.tx_.get();
                 ownsTx_ = false;
             } else if (opts.auto_transaction) {
-                ownedTx_ = std::make_unique<pqxx::work>(*owner_.conn_);
+                ownedTx_ = std::make_unique<PgTx>(*owner_.conn_);
                 tx_ = ownedTx_.get();
                 ownsTx_ = true;
             } else {
@@ -398,8 +425,8 @@ namespace dbmw::driver {
         }
 
         PostgresConnection &owner_;
-        pqxx::work *tx_ = nullptr;
-        std::unique_ptr<pqxx::work> ownedTx_;
+        PgTx *tx_ = nullptr;
+        std::unique_ptr<PgTx> ownedTx_;
         bool ownsTx_ = false;
         std::string name_;
         std::size_t batchSize_ = 256;
@@ -487,7 +514,7 @@ namespace dbmw::driver {
 #ifdef DBMW_ENABLE_POSTGRES
         if (!open_ || !conn_) return notConnected("ping");
         try {
-            pqxx::work tx{*conn_};
+            PgTx tx{*conn_};
             tx.exec("SELECT 1");
             tx.commit();
             return common::Status::OK();
@@ -508,7 +535,7 @@ namespace dbmw::driver {
                 // 处于 begin() 后的显式事务中：复用该事务，此处不提交
                 fillResultSet(tx_->exec(sql), out, cfg_.max_result_rows);
             } else {
-                pqxx::work tx{*conn_};
+                PgTx tx{*conn_};
                 fillResultSet(tx.exec(sql), out, cfg_.max_result_rows);
                 tx.commit();
             }
@@ -541,7 +568,7 @@ namespace dbmw::driver {
             if (tx_) {
                 fillResultSet(execParams(*tx_, pgSql, pp), out, cfg_.max_result_rows);
             } else {
-                pqxx::work tx{*conn_};
+                PgTx tx{*conn_};
                 fillResultSet(execParams(tx, pgSql, pp), out, cfg_.max_result_rows);
                 tx.commit();
             }
@@ -566,7 +593,7 @@ namespace dbmw::driver {
             if (tx_) {
                 affected = static_cast<std::int64_t>(tx_->exec(sql).affected_rows());
             } else {
-                pqxx::work tx{*conn_};
+                PgTx tx{*conn_};
                 affected = static_cast<std::int64_t>(tx.exec(sql).affected_rows());
                 tx.commit();
             }
@@ -599,7 +626,7 @@ namespace dbmw::driver {
             if (tx_) {
                 affected = static_cast<std::int64_t>(execParams(*tx_, pgSql, pp).affected_rows());
             } else {
-                pqxx::work tx{*conn_};
+                PgTx tx{*conn_};
                 affected = static_cast<std::int64_t>(execParams(tx, pgSql, pp).affected_rows());
                 tx.commit();
             }
@@ -629,7 +656,7 @@ namespace dbmw::driver {
         if (found != params.size()) return paramMismatch(params.size(), found);
         try {
             if (tx_) return streamRows(*tx_, pgSql, params, callback, rows);
-            pqxx::work tx{*conn_};
+            PgTx tx{*conn_};
             const auto status = streamRows(tx, pgSql, params, callback, rows);
             if (status.ok()) tx.commit();
             return status;
@@ -669,10 +696,10 @@ namespace dbmw::driver {
             // 此时保留部分影响行数供其判断。
             if (tx_) return run(*tx_);
 
-            // 自建事务：pqxx::work 析构时自动回滚（RAII），整批原子。
+            // 自建事务：PgTx 析构时自动回滚（RAII），整批原子。
             // 与基类 executeBatch 的默认实现保持一致：已回滚就不该再报告
             // 部分影响行数，否则调用方会以为前几组真的写进去了。
-            pqxx::work transaction{*conn_};
+            PgTx transaction{*conn_};
             const auto status = run(transaction);
             if (status.ok()) {
                 transaction.commit();
@@ -699,7 +726,7 @@ namespace dbmw::driver {
         try {
             pqxx::result r;
             if (tx_) r = tx_->exec(sql);
-            else { pqxx::work w{*conn_}; r = w.exec(sql); w.commit(); }
+            else { PgTx w{*conn_}; r = w.exec(sql); w.commit(); }
             affected = static_cast<std::int64_t>(r.affected_rows());
             // RETURNING 出来的结果集即生成键；无 RETURNING 则 0 行（keys 为空）。
             fillResultSet(r, out.rows, 0);
@@ -728,7 +755,7 @@ namespace dbmw::driver {
             appendParams(pp, params);
             pqxx::result r;
             if (tx_) r = execParams(*tx_, pgSql, pp);
-            else { pqxx::work w{*conn_}; r = execParams(w, pgSql, pp); w.commit(); }
+            else { PgTx w{*conn_}; r = execParams(w, pgSql, pp); w.commit(); }
             affected = static_cast<std::int64_t>(r.affected_rows());
             fillResultSet(r, out.rows, 0); // RETURNING 透传为生成键
             return common::Status::OK();
@@ -816,10 +843,10 @@ namespace dbmw::driver {
         appendParams(pp, params);
         try {
             if (tx_) {
-                fillResultSet(tx_->exec(pqxx::prepped{name}, pp), out, cfg_.max_result_rows);
+                fillResultSet(execPrepared(*tx_, name, pp), out, cfg_.max_result_rows);
             } else {
-                pqxx::work w{*conn_};
-                fillResultSet(w.exec(pqxx::prepped{name}, pp), out, cfg_.max_result_rows);
+                PgTx w{*conn_};
+                fillResultSet(execPrepared(w, name, pp), out, cfg_.max_result_rows);
                 w.commit();
             }
             return common::Status::OK();
@@ -848,11 +875,11 @@ namespace dbmw::driver {
         try {
             if (tx_) {
                 affected = static_cast<std::int64_t>(
-                    tx_->exec(pqxx::prepped{name}, pp).affected_rows());
+                    execPrepared(*tx_, name, pp).affected_rows());
             } else {
-                pqxx::work w{*conn_};
+                PgTx w{*conn_};
                 affected = static_cast<std::int64_t>(
-                    w.exec(pqxx::prepped{name}, pp).affected_rows());
+                    execPrepared(w, name, pp).affected_rows());
                 w.commit();
             }
             return common::Status::OK();
@@ -929,7 +956,7 @@ namespace dbmw::driver {
         if (tx_)
             return common::Status::error(common::ErrorCode::TxError, "PostgreSQL: transaction already active");
         try {
-            tx_ = std::make_unique<pqxx::work>(*conn_);
+            tx_ = std::make_unique<PgTx>(*conn_);
             return common::Status::OK();
         } catch (std::exception const &e) {
             return postgresError(common::ErrorCode::TxError, "BEGIN", e);
@@ -946,7 +973,7 @@ namespace dbmw::driver {
             return common::Status::error(common::ErrorCode::TxError,
                                          "PostgreSQL: transaction already active");
         try {
-            tx_ = std::make_unique<pqxx::work>(*conn_);
+            tx_ = std::make_unique<PgTx>(*conn_);
             std::string settings;
             switch (options.isolation) {
                 case common::IsolationLevel::Default: break;

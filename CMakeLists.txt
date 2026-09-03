@@ -118,6 +118,30 @@ if(DBMW_ENABLE_POSTGRES)
         message(FATAL_ERROR "DBMW_ENABLE_POSTGRES=ON but libpqxx/libpq not found. "
             "Run: sudo apt install -y libpqxx-dev libpq-dev")
     endif()
+
+    # 各发行版自带的 libpqxx 主版本差距极大：Ubuntu 24.04 是 7.8，Homebrew 是 8.0。
+    # 8.0 有两个破坏性变化：① 最低 C++ 标准由 17 提到 20；② 删掉了 pqxx::work。
+    # ② 已在 postgres_driver.cpp 里用 PgTx 别名消化掉，这里负责 ①：按需单独给
+    # dbmw 目标提标，避免出现"Linux 编得过、macOS 编不过"（或反之）的情况。
+    file(STRINGS "${PQXX_INCLUDE_DIR}/pqxx/version.hxx" _dbmw_pqxx_major_line
+         REGEX "^#[ ]*define[ ]+PQXX_VERSION_MAJOR[ ]+[0-9]+")
+    string(REGEX MATCH "([0-9]+)" _dbmw_pqxx_major "${_dbmw_pqxx_major_line}")
+    if(NOT _dbmw_pqxx_major)
+        message(WARNING "dbmw: 无法从 ${PQXX_INCLUDE_DIR}/pqxx/version.hxx 中解析 "
+                        "PQXX_VERSION_MAJOR，按 C++17 构建。")
+        set(_dbmw_pqxx_major 7)
+    endif()
+    if(_dbmw_pqxx_major LESS 7)
+        message(FATAL_ERROR "dbmw: 需要 libpqxx >= 7，当前主版本为 ${_dbmw_pqxx_major}。"
+            " 6.x 缺少 pqxx::zview / pqxx::params，请改用 Ubuntu 24.04+ 或 Homebrew 的"
+            " libpqxx，或关闭 -DDBMW_ENABLE_POSTGRES=OFF。")
+    endif()
+    message(STATUS "dbmw: libpqxx 主版本 ${_dbmw_pqxx_major}")
+    if(_dbmw_pqxx_major GREATER_EQUAL 8)
+        message(STATUS "dbmw: libpqxx >= 8 要求 C++20，dbmw 目标单独提标至 C++20")
+        set_target_properties(dbmw PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    endif()
+
     target_include_directories(dbmw PRIVATE ${PQXX_INCLUDE_DIR} ${PQ_INCLUDE_DIR})
     target_link_libraries(dbmw PRIVATE ${PQXX_LIBRARY} ${PQ_LIBRARY})
 endif()

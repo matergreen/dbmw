@@ -55,7 +55,7 @@ namespace dbmw::core {
         //
         // 逐条直发的话，第 N 组失败会留下前 N-1 组的写入，而调用方拿到的
         // BatchResult 又看不出到底落了几组——这类部分写入是最难排查的数据损坏。
-        // 这里与 PostgreSQL 驱动自建 pqxx::work 的行为对齐，让三个驱动语义一致。
+        // 这里与 PostgreSQL 驱动自建事务（PgTx）的行为对齐，让三个驱动语义一致。
         //
         // 调用方已在事务里时直接沿用，失败交由调用方决定回滚范围。
         const bool ownTx = !inTransaction();
