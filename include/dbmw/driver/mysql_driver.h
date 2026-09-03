@@ -13,7 +13,7 @@
 #include <unordered_map>
 
 #ifdef DBMW_ENABLE_MYSQL
-#include <mysql/mysql.h>
+#include <mysql.h>
 
 // MySQL 8.0 移除了 my_bool（改为 bool），5.7 及更早版本只有 my_bool。
 // MYSQL_BIND::is_null 的类型随版本不同，这里统一成一个别名。

@@ -9,7 +9,7 @@
 #include <vector>
 
 #ifdef DBMW_ENABLE_MYSQL
-#include <mysql/mysql.h>
+#include <mysql.h>
 #endif
 
 
