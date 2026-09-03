@@ -583,7 +583,11 @@ int main() {
     std::cout << "== 20. 安全配置：环境变量密码与热加载清理 ==\n";
     {
         const std::string path = "/tmp/dbmw_config_loader_test.json";
+#ifdef _WIN32
+        (void)_putenv_s("DBMW_TEST_PASSWORD", "from-env");
+#else
         setenv("DBMW_TEST_PASSWORD", "from-env", 1);
+#endif
         {
             std::ofstream file(path);
             file << R"({
@@ -605,7 +609,11 @@ int main() {
               loaded.datasources.front().describe().find("from-env") == std::string::npos,
               "密码从环境变量解析且 describe() 不泄漏密码");
         std::remove(path.c_str());
+#ifdef _WIN32
+        (void)_putenv_s("DBMW_TEST_PASSWORD", "");
+#else
         unsetenv("DBMW_TEST_PASSWORD");
+#endif
     }
 
     std::cout << "== 21. 韧性：查询安全重试，写入默认不重试 ==\n";
