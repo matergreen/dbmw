@@ -1,0 +1,189 @@
+# dbmw 跨平台构建 / 测试 / 打包
+#
+# 触发时机：
+#   - push 到 main / master：编译 + 测试，产物作为 artifact 留存
+#   - PR 到 main / master：同上（作为合并门禁）
+#   - push tag v*：额外产出 GitHub Release，把各平台包挂上去
+#   - workflow_dispatch：手动触发（Actions 页面 → Run workflow）
+#
+# 发版只需两步：
+#   git tag v0.1.0 && git push origin v0.1.0
+# Release 标题与更新日志会自动生成。
+
+name: build
+
+on:
+  push:
+    branches: ["main", "master"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+# 同一分支连续推送只保留最新一次，避免排队烧额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 最小权限：全局只读，发布 job 单独申请写权限
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.pkg }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---------------- Linux x86_64：gcc 与 clang 各一套，三驱动全开 ----------------
+          - { os: ubuntu-24.04,     pkg: linux-x86_64-gcc,   drivers: 'ON',  tests: true,
+              cc: gcc,   cxx: g++ }
+          - { os: ubuntu-24.04,     pkg: linux-x86_64-clang, drivers: 'ON',  tests: true,
+              cc: clang, cxx: clang++ }
+
+          # ---------------- Linux arm64 ----------------
+          # GitHub 对公开仓库免费提供 ARM runner；私有仓库需付费。
+          # 若提示 runner 不存在，直接删掉这一行。
+          - { os: ubuntu-24.04-arm, pkg: linux-aarch64-gcc,  drivers: 'ON',  tests: true,
+              cc: gcc,   cxx: g++ }
+
+          # ---------------- macOS ----------------
+          # 托管 runner 现在只有 arm64 机器（macos-14 / macos-15），Homebrew 装出来的
+          # 也只有 arm64 库，因此 x86_64 包无法在这里交叉编译（链接必然架构不匹配）。
+          # 需要 Intel Mac 的包：用自托管 runner，或让用户按 README 本地构建。
+          - { os: macos-14,         pkg: macos-arm64-clang,  drivers: 'ON',  tests: true,
+              cc: clang, cxx: clang++ }
+
+          # ---------------- Windows ----------------
+          # runner 上没有 libpqxx / libmysqlclient；且 CMakeLists 里 ODBC 走
+          # find_library(NAMES odbc)，MSVC 下找不到会 FATAL_ERROR，故只编核心层。
+          - { os: windows-latest,   pkg: windows-x86_64-msvc, drivers: 'OFF', tests: true }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ----------------------------------------------------------- 安装依赖
+      - name: 安装依赖 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          sudo apt-get install -y default-libmysqlclient-dev libpqxx-dev libpq-dev unixodbc-dev
+
+      - name: 安装依赖 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja mysql-client libpqxx libpq unixodbc
+
+      - name: 组装 CMAKE_PREFIX_PATH (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          p="$(brew --prefix)"
+          for formula in mysql-client libpq libpqxx unixodbc; do
+            if d="$(brew --prefix "$formula" 2>/dev/null)"; then p="$p;$d"; fi
+          done
+          echo "CMAKE_PREFIX_PATH=$p" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------- 配置
+      # 注意 DBMW_ENABLE_ODBC 在 CMakeLists.txt 里默认 ON，不显式传值就会去找
+      # unixODBC，找不到即 FATAL_ERROR，所以每个平台都显式指定。
+      - name: 配置 (Linux / macOS)
+        if: runner.os != 'Windows'
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDBMW_ENABLE_MYSQL=${{ matrix.drivers }} \
+            -DDBMW_ENABLE_POSTGRES=${{ matrix.drivers }} \
+            -DDBMW_ENABLE_ODBC=${{ matrix.drivers }} \
+            -DDBMW_BUILD_EXAMPLES=ON \
+            -DDBMW_BUILD_TESTS=ON
+
+      # Windows 走默认的 Visual Studio 多配置生成器，Release 在 --config 里指定
+      - name: 配置 (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -S . -B build -A x64 `
+            -DDBMW_ENABLE_MYSQL=${{ matrix.drivers }} `
+            -DDBMW_ENABLE_POSTGRES=${{ matrix.drivers }} `
+            -DDBMW_ENABLE_ODBC=${{ matrix.drivers }} `
+            -DDBMW_BUILD_EXAMPLES=ON `
+            -DDBMW_BUILD_TESTS=ON
+
+      - name: 编译
+        run: cmake --build build --config Release -j
+
+      - name: 测试
+        if: matrix.tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      # ----------------------------------------------------------- 安装打包
+      - name: 安装到 dist
+        run: cmake --install build --config Release --prefix dist
+
+      - name: 打包
+        shell: bash
+        run: |
+          set -euo pipefail
+          # tag 推送时取 tag 名（去 v 前缀），其余用 dev-<短 sha>
+          ver="${GITHUB_REF_NAME#v}"
+          if [ "$ver" = "$GITHUB_REF_NAME" ]; then ver="dev-${GITHUB_SHA::7}"; fi
+          if [ "${{ runner.os }}" = "Windows" ]; then ext=zip; else ext=tar.gz; fi
+          pkg="dbmw-${ver}-${{ matrix.pkg }}.${ext}"
+          cp LICENSE README.md dist/
+          if [ "$ext" = "zip" ]; then
+            powershell -NoProfile -Command "Compress-Archive -Path 'dist/*' -DestinationPath '${pkg}'"
+          else
+            tar -czf "${pkg}" -C dist .
+          fi
+          ls -l "${pkg}"
+          echo "PKG_FILE=${pkg}" >> "$GITHUB_ENV"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbmw-${{ matrix.pkg }}
+          path: ${{ env.PKG_FILE }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # ------------------------------------------------------------------ 发布
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 收集各平台产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dbmw-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: 创建 Release 并上传资产
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l artifacts
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "dbmw $TAG" \
+              --verify-tag \
+              --generate-notes \
+              artifacts/*
+          fi

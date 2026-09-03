@@ -1,0 +1,11 @@
+prefix="@CMAKE_INSTALL_PREFIX@"
+exec_prefix="${prefix}"
+libdir="${prefix}/@CMAKE_INSTALL_LIBDIR@"
+includedir="${prefix}/@CMAKE_INSTALL_INCLUDEDIR@"
+
+Name: dbmw
+Description: C++17 database middleware - pooled connections, heartbeat, multi-driver (MySQL/PostgreSQL/ODBC)
+URL: https://github.com/matergreen/dbmw
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -ldbmw
+Cflags: -I${includedir}

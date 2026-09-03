@@ -1,0 +1,21 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# ---------------------------------------------------------------------------
+# dbmw 以静态库形式安装。关于驱动客户端库的重要说明：
+#
+# 静态库不会把 PRIVATE 依赖"打包"进来，但 CMake 会把它们以 $<LINK_ONLY:...>
+# 的形式记进 dbmwTargets.cmake 的 INTERFACE_LINK_LIBRARIES。因此构建时开启了
+# 哪些 DBMW_ENABLE_*，下游机器就得自行安装并对齐这些客户端库：
+#
+#   DBMW_ENABLE_MYSQL     -> -lmysqlclient   (apt: default-libmysqlclient-dev)
+#   DBMW_ENABLE_POSTGRES  -> -lpqxx -lpq     (apt: libpqxx-dev libpq-dev)
+#   DBMW_ENABLE_ODBC      -> -lodbc          (apt: unixodbc-dev)
+#
+# 详见 README「驱动客户端库（务必阅读）」一节。
+# ---------------------------------------------------------------------------
+
+include("${CMAKE_CURRENT_LIST_DIR}/dbmwTargets.cmake")
+
+check_required_components(dbmw)
