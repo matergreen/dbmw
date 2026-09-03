@@ -1954,7 +1954,7 @@ namespace dbmw::core {
         std::lock_guard<std::mutex> lk(mtx_);
         result.reserve(pools_.size());
         for (const auto & [fst, snd]: pools_)
-            result.push_back(NamedPoolStats{.dataSource = fst, .stats = snd->stats()});
+            result.push_back(NamedPoolStats{fst, snd->stats()});
         std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) {
             return a.dataSource < b.dataSource;
         });
