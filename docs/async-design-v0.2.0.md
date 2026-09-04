@@ -356,7 +356,7 @@ N 个 worker：循环取任务执行；异常一律 catch + 记日志（worker �
 
 - **线程数**：默认 `hardware_concurrency`。异步模式下"并发能力 = worker 数 × 单 worker 周转率"，与连接池 `max` 解耦——池满时操作挂在**池等待者队列**而不是占 worker（§7）。
 - **定时精度**：毫秒级（`steady_clock` + cv wait_until），满足退避与超时检查需求，不追求微秒。
-- **关闭顺序**：`shutdown(grace)` = 停止接受新任务 → timer 线程把未到期定时任务按"已到期/可丢弃（超时检查类）或立即执行（重试类）"分类冲入队列 → worker 排空队列（受 grace 限制）→ join。
+- **关闭顺序**：`shutdown(grace)` = 停止接受新任务 → 上层在 grace 内等待在途操作 → 丢弃未到期的定时任务 → worker 协作式排空并 join。`grace` 不是线程强杀硬上限；驱动不支持 cancel 时必须等阻塞调用返回，否则分离线程会访问已释放的连接/执行器状态。
 
 ### 6.3 过载保护
 

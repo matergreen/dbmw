@@ -36,13 +36,13 @@
 > 驱动实现进度：
 > - **MySQL 已完整实现**（libmysqlclient）：连接超时/字符集、ping、按列类型映射结果集、
 >   显式事务、`mysql_real_escape_string` 转义；并支持 **`mysql_stmt_prepare` 服务端预编译**
->   （连接级句柄缓存）、`mysql_insert_id` **生成键**、超大 BLOB **流式写入**。
+>   （连接级句柄缓存）、`mysql_insert_id` **生成键**、大 BLOB 统一参数接口。
 > - **PostgreSQL 已完整实现**（libpqxx）：connstring 拼接/超时/字符集、ping、
 >   结果集按 OID 映射、显式事务；通过 `pqxx::params` 支持**服务端参数绑定**（内部经 `execParams()` 封装），
->   并支持命名预备语句 **预编译缓存**（LRU `DEALLOCATE`）、`RETURNING` **生成键**、超大 BLOB **流式写入**。
+>   并支持命名预备语句 **预编译缓存**（LRU `DEALLOCATE`）、`RETURNING` **生成键**、大 BLOB 统一参数接口。
 > - **ODBC 已完整实现**（unixODBC）：DSN/连接串、诊断记录、类型映射、原生参数绑定、
 >   查询超时/取消、事务与 SQL Server/标准保存点方言；并支持 **`SQLPrepare`/`SQLExecute` 预编译缓存**、
->   `OUTPUT INSERTED`/`RETURNING` **生成键**、超大 BLOB **流式写入**。
+>   `OUTPUT INSERTED`/`RETURNING` **生成键**、大 BLOB 统一参数接口。
 >
 > 预编译与生成键为三个驱动各自实现；大参数流式（`StreamSource`）当前三驱动统一以**缓冲降级**实现
 > （一次性读成 `Blob` 再按普通参数绑定），调用代码保持一致，MySQL `send_long_data` / ODBC `SQLPutData` 真分块为后续增强。
@@ -107,7 +107,8 @@ cmake .. -DDBMW_BUILD_TESTS=ON && cmake --build . && ctest --output-on-failure
 
 macOS 用 [Homebrew](https://brew.sh) 管理依赖，编译器走系统 **clang++**（需先装 Xcode Command Line Tools）。Homebrew 的包装在 `/opt/homebrew`（Apple Silicon）或 `/usr/local`（Intel），CMake 默认搜索路径未必覆盖，建议显式用 `CMAKE_PREFIX_PATH` 指明客户端库位置。
 
-> **注意**：`DBMW_ENABLE_ODBC` 在本项目的 `CMakeLists.txt` 里**默认是 `ON`**。macOS 上若没装 unixODBC，直接 `cmake ..` 会触发 `FATAL_ERROR`——要么先 `brew install unixodbc`，要么显式 `-DDBMW_ENABLE_ODBC=OFF`。
+> **注意**：`DBMW_ENABLE_ODBC` 默认是 `OFF`。需要 ODBC 时先安装 unixODBC，
+> 再显式传入 `-DDBMW_ENABLE_ODBC=ON`。
 
 ```bash
 # 1) 命令行工具（提供 clang++ / make）
@@ -456,12 +457,15 @@ cur->close();   // 显式归还连接；不调也会在析构时关 + 还
 
 ### 主库故障转移（failover）
 
-组配置 `failover.primaries` 给出有序可写候选（主自动置顶）。写路径按序挑选**未熔断**的候选执行；全部不可用时：
+组配置 `failover.primaries` 给出有序可写候选（主自动置顶）。只有能确定 SQL
+尚未下发的失败（建连失败、连接池未借到连接、熔断前置拒绝等）才会切换候选。
+执行中断线或超时存在“已提交但回包丢失”的歧义，中间件会直接返回错误，
+不会在另一个主库上盲目重放。全部候选在执行前就不可用时：
 
 - 若配了 `failover.write_buffer`，写请求进入有界内存队列，由后台 flush 线程在主恢复后补发，立即返回 `Buffered`（**软降级**：入队即返回，不代表已提交，进程崩溃会丢数据）；
 - 否则返回 `CircuitOpen`（标记为可重试，由上层重试/熔断处理）。
 
-约束：**故障转移和写缓冲都不用于事务**——事务回调未必幂等，重放可能造成重复写入，因此主不可用时事务直接失败，由调用方决定补发。写路径只在「连接类/熔断」失败时换节点，业务失败（如唯一键冲突）直返不换节点。
+约束：**故障转移和写缓冲都不用于事务**——事务回调未必幂等，重放可能造成重复写入，因此主不可用时事务直接失败，由调用方决定补发。
 
 ```json
 {
@@ -615,7 +619,7 @@ cur->close();   // 显式归还连接；不调也会在析构时关 + 还
 { "async": { "enabled": true, "threads": 4, "queue_size": 4096 } }
 ```
 
-`threads` 是 worker 数（0 = hardware_concurrency），另有 1 个 timer 线程负责重试退避与超时检查；队列满时新操作以 `Overloaded` 快速失败（显式背压，不是隐式排队）。`DBMW::shutdown` 会先拒绝新操作、等在途操作归零后再停执行器与连接池。
+`threads` 是 worker 数（0 = hardware_concurrency），另有 1 个 timer 线程负责重试退避与超时检查；队列满时新操作以 `Overloaded` 快速失败（显式背压，不是隐式排队）。`DBMW::shutdown` 会先拒绝新操作、在 `grace` 内等待在途操作，然后协作式停止执行器与连接池。C++ 无法安全强杀仍在访问连接状态的线程；如果底层驱动不支持取消，停机可能继续等到该驱动调用返回/网络超时。
 
 **回调式（热路径）**——完成回调由完成调度器投递，绝不在调用栈上执行；返回的 `Handle` 支持取消：
 

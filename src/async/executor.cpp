@@ -85,8 +85,9 @@ namespace dbmw::async {
                 for (auto &w: workers) {
                     if (w.joinable()) w.join();
                 }
-                // 宽限期内没跑完的任务只能丢弃：执行器无法凭空造出线程去执行它们。
-                // 引擎的排水顺序（先等在途操作归零再停执行器）保证这是罕见路径。
+                // C++ 不能安全强杀正在访问执行器/连接池状态的 worker。
+                // grace 由引擎排水阶段消耗；到这里后必须协作式 join，
+                // 驱动若不支持 cancel，停机可能等到底层网络超时。
                 (void) grace;
             }
 

@@ -15,7 +15,7 @@
 
 namespace dbmw::driver {
     namespace {
-        bool validSavepointName(const std::string &name) {
+        [[maybe_unused]] bool validSavepointName(const std::string &name) {
             if (name.empty() || !(std::isalpha(static_cast<unsigned char>(name[0])) ||
                                   name[0] == '_')) return false;
             return std::all_of(name.begin() + 1, name.end(), [](const char c) {
@@ -23,7 +23,7 @@ namespace dbmw::driver {
             });
         }
 
-        common::Status notConnected(const char *where) {
+        [[maybe_unused]] common::Status notConnected(const char *where) {
             return common::Status::error(common::ErrorCode::NotConnected,
                                          std::string("MySQL: not connected (") + where + ")");
         }
@@ -889,7 +889,7 @@ namespace dbmw::driver {
         out = std::move(cur);
         return common::Status::OK();
 #else
-        (void) sql; (void) params; (void) opts;
+        (void) sql; (void) params; (void) opts; out.reset();
         return common::Status::error(common::ErrorCode::DriverDisabled, "MySQL driver disabled");
 #endif
     }

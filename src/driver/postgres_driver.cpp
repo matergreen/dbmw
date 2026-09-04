@@ -36,12 +36,13 @@
 
 namespace dbmw::driver {
     namespace {
-        common::Status notConnected(const char *where) {
+        [[maybe_unused]] common::Status notConnected(const char *where) {
             return common::Status::error(common::ErrorCode::NotConnected,
                                          std::string("PostgreSQL: not connected (") + where + ")");
         }
 
-        common::Status paramMismatch(std::size_t supplied, std::size_t placeholders) {
+        [[maybe_unused]] common::Status paramMismatch(std::size_t supplied,
+                                                      std::size_t placeholders) {
             return common::Status::error(
                 common::ErrorCode::QueryError,
                 "parameter mismatch: supplied " + std::to_string(supplied)
@@ -92,7 +93,7 @@ namespace dbmw::driver {
             return s;
         }
 
-        common::Blob parseBytea(const std::string &s) {
+        [[maybe_unused]] common::Blob parseBytea(const std::string &s) {
             common::Blob b;
             auto nibble = [](const char c) -> int {
                 if (c >= '0' && c <= '9') return c - '0';
@@ -937,7 +938,7 @@ namespace dbmw::driver {
             return postgresError(common::ErrorCode::CursorError, "openCursor", e);
         }
 #else
-        (void) sql; (void) params; (void) opts;
+        (void) sql; (void) params; (void) opts; out.reset();
         return common::Status::error(common::ErrorCode::DriverDisabled,
                                      "PostgreSQL driver disabled");
 #endif

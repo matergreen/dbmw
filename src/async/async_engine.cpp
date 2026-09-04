@@ -5,9 +5,11 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -42,6 +44,65 @@ namespace dbmw::async {
         std::atomic<bool> gStopping{false};
         std::atomic<std::int64_t> gDefaultTimeoutMs{0};
 
+        // 完成队列过载/停止时的保底调度器。用单独线程保证用户回调
+        // 绝不回退到发起调用的栈上执行，同时避免每次过载都新建线程。
+        class CompletionFallback final {
+        public:
+            CompletionFallback() : worker_([this] { run(); }) {}
+            ~CompletionFallback() {
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    stopping_ = true;
+                }
+                cv_.notify_one();
+                if (worker_.joinable()) worker_.join();
+            }
+
+            void post(std::function<void()> task) {
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    queue_.push_back(std::move(task));
+                }
+                cv_.notify_one();
+            }
+
+        private:
+            void run() {
+                for (;;) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lk(mtx_);
+                        cv_.wait(lk, [this] { return stopping_ || !queue_.empty(); });
+                        if (queue_.empty() && stopping_) return;
+                        task = std::move(queue_.front());
+                        queue_.pop_front();
+                    }
+                    guardedRun(task);
+                }
+            }
+
+            static void guardedRun(const std::function<void()> &task) {
+                try {
+                    if (task) task();
+                } catch (const std::exception &e) {
+                    DBMW_LOG_ERROR(std::string("async completion callback threw: ") + e.what());
+                } catch (...) {
+                    DBMW_LOG_ERROR("async completion callback threw an unknown exception");
+                }
+            }
+
+            std::mutex mtx_;
+            std::condition_variable cv_;
+            std::deque<std::function<void()> > queue_;
+            bool stopping_ = false;
+            std::thread worker_;
+        };
+
+        CompletionFallback &completionFallback() {
+            static CompletionFallback dispatcher;
+            return dispatcher;
+        }
+
         std::shared_ptr<IExecutor> workerExecutor() {
             std::lock_guard<std::mutex> lk(gMtx);
             return gExecutor;
@@ -72,6 +133,12 @@ namespace dbmw::async {
         void postOrRun(const std::shared_ptr<IExecutor> &ex, const std::function<void()> &task) {
             if (ex && ex->tryPost(task)) return; // 拷贝提交；失败时 task 未被消耗
             task();
+        }
+
+        void postCompletion(const std::shared_ptr<IExecutor> &ex,
+                            const std::function<void()> &task) {
+            if (ex && ex->tryPost(task)) return;
+            completionFallback().post(task);
         }
 
         // 池的 AsyncIo：post/deliver 都指向 worker 执行器（借出结果回来后
@@ -200,7 +267,7 @@ namespace dbmw::async {
             static void deliverResult(std::function<void(R &&)> cb, R result) {
                 auto resultBox = std::make_shared<R>(std::move(result));
                 auto cbBox = std::make_shared<std::function<void(R &&)> >(std::move(cb));
-                postOrRun(completionExecutor(), [resultBox, cbBox] {
+                postCompletion(completionExecutor(), [resultBox, cbBox] {
                     (*cbBox)(std::move(*resultBox));
                 });
             }
@@ -567,8 +634,10 @@ namespace dbmw::async {
                 // 2) 转移下一候选（读回退 / 写 failover）。条件与同步一致：
                 //    retryable || connectionBroken || CircuitOpen；
                 //    queryEach 的组回退仅在零行时发生（已交付过行绝不重放）。
-                const bool transferable = st.retryable || st.connectionBroken ||
-                                          st.code == common::ErrorCode::CircuitOpen;
+                const bool transferable = ctx->policy.isWrite
+                    ? core::DataSource::safeToFailoverWrite(st)
+                    : (st.retryable || st.connectionBroken ||
+                       st.code == common::ErrorCode::CircuitOpen);
                 // rows 成员只在 EachResult 上（fallbackOnlyIfNoRows 仅 queryEach
                 // 置位），编译期裁剪避免对其他 R 实例化失败。
                 bool rowsOk = true;
@@ -585,7 +654,8 @@ namespace dbmw::async {
                 // 3) 写缓冲（组路径、execute/executeBatch、候选全部耗尽）。
                 //    要求生成键的写不入缓冲：补发时拿不到键（与同步一致，
                 //    该族根本不构造 bufferedMaker）。
-                if (ctx->policy.isWrite && ctx->policy.allowWriteBuffer && ctx->root->primary_
+                if (transferable && ctx->policy.isWrite && ctx->policy.allowWriteBuffer &&
+                    ctx->root->primary_
                     && ctx->root->writeBuffer_ && ctx->root->writeBuffer_->enabled()
                     && ctx->bufferedMaker) {
                     if (ctx->root->writeBuffer_->enqueue(ctx->bufferedMaker(

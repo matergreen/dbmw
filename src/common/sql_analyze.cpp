@@ -1,7 +1,6 @@
 #include "dbmw/common/sql_analyze.h"
 
 #include <cctype>
-#include <cstring>
 
 
 namespace dbmw::common::sql {
@@ -230,19 +229,69 @@ namespace dbmw::common::sql {
             return out;
         }
 
-        // 在裸结构文本中查找独立的 SQL 关键字（大小写不敏感，词边界匹配）。
-        bool containsKeyword(const std::string &masked, const char *kw) {
+        // 在裸结构文本的括号深度 0 查找独立关键字。
+        // CTE/子查询中的 WHERE/LIMIT 不能替外层语句过审。
+        bool containsTopLevelKeyword(const std::string &masked, const char *kw) {
             const std::size_t klen = std::char_traits<char>::length(kw);
             const std::size_t n = masked.size();
+            int depth = 0;
             for (std::size_t i = 0; i + klen <= n; ++i) {
-                if (std::strncmp(masked.c_str() + i, kw, klen) != 0) continue;
+                if (masked[i] == '(') { ++depth; continue; }
+                if (masked[i] == ')') { if (depth > 0) --depth; continue; }
+                if (depth != 0) continue;
+                bool matches = true;
+                for (std::size_t k = 0; k < klen; ++k) {
+                    if (std::toupper(static_cast<unsigned char>(masked[i + k])) !=
+                        std::toupper(static_cast<unsigned char>(kw[k]))) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (!matches) continue;
                 const bool leftOk = (i == 0) ||
-                    !std::isalnum(static_cast<unsigned char>(masked[i - 1])) && masked[i - 1] != '_';
+                    (!std::isalnum(static_cast<unsigned char>(masked[i - 1])) &&
+                     masked[i - 1] != '_');
                 const bool rightOk = (i + klen == n) ||
-                    !std::isalnum(static_cast<unsigned char>(masked[i + klen])) && masked[i + klen] != '_';
+                    (!std::isalnum(static_cast<unsigned char>(masked[i + klen])) &&
+                     masked[i + klen] != '_');
                 if (leftOk && rightOk) return true;
             }
             return false;
+        }
+
+        std::string upperFirstVerb(const std::string &masked);
+
+        std::string upperMainVerb(const std::string &masked) {
+            const std::string first = upperFirstVerb(masked);
+            if (first != "WITH") return first;
+
+            // WITH [RECURSIVE] cte AS (...) [, ...] <main-verb> ...
+            // CTE 查询体都在括号内，因此只要在 depth==0 找第一个真正的
+            // DML 动词即可。标识符和字面量已由 maskLiteralRegions 屏蔽。
+            int depth = 0;
+            std::string nestedWrite;
+            for (std::size_t i = 0; i < masked.size();) {
+                const unsigned char c = static_cast<unsigned char>(masked[i]);
+                if (c == '(') { ++depth; ++i; continue; }
+                if (c == ')') { if (depth > 0) --depth; ++i; continue; }
+                if (std::isalpha(c) || c == '_') {
+                    std::string token;
+                    while (i < masked.size()) {
+                        const unsigned char tc = static_cast<unsigned char>(masked[i]);
+                        if (!std::isalnum(tc) && tc != '_') break;
+                        token.push_back(static_cast<char>(std::toupper(tc)));
+                        ++i;
+                    }
+                    const bool write = token == "INSERT" || token == "UPDATE" ||
+                        token == "DELETE" || token == "MERGE" || token == "REPLACE";
+                    if (depth > 0 && write && nestedWrite.empty()) nestedWrite = token;
+                    if (depth == 0 && (token == "SELECT" || write))
+                        return !nestedWrite.empty() ? nestedWrite : token;
+                    continue;
+                }
+                ++i;
+            }
+            return first; // 无法确定时保持保守的 WITH 分类
         }
 
         std::string upperFirstVerb(const std::string &masked) {
@@ -277,8 +326,8 @@ namespace dbmw::common::sql {
     }
 
     StatementKind classifyStatement(const std::string &sql) {
-        const std::string verb = upperFirstVerb(maskLiteralRegions(sql));
-        if (verb == "SELECT" || verb == "WITH" || verb == "SHOW" || verb == "EXPLAIN" ||
+        const std::string verb = upperMainVerb(maskLiteralRegions(sql));
+        if (verb == "SELECT" || verb == "SHOW" || verb == "EXPLAIN" ||
             verb == "DESC" || verb == "DESCRIBE")
             return StatementKind::Select;
         if (verb == "INSERT" || verb == "REPLACE") return StatementKind::Insert;
@@ -292,14 +341,29 @@ namespace dbmw::common::sql {
 
     bool isWrite(StatementKind kind) {
         return kind == StatementKind::Insert || kind == StatementKind::Update ||
-            kind == StatementKind::Delete || kind == StatementKind::Ddl;
+            kind == StatementKind::Delete || kind == StatementKind::Ddl ||
+            kind == StatementKind::Other;
     }
 
     bool hasWhereClause(const std::string &sql) {
-        return containsKeyword(maskLiteralRegions(sql), "WHERE");
+        return containsTopLevelKeyword(maskLiteralRegions(sql), "WHERE");
     }
 
     bool hasLimitClause(const std::string &sql) {
-        return containsKeyword(maskLiteralRegions(sql), "LIMIT");
+        return containsTopLevelKeyword(maskLiteralRegions(sql), "LIMIT");
+    }
+
+    bool hasMultipleStatements(const std::string &sql) {
+        const std::string masked = maskLiteralRegions(sql);
+        int depth = 0;
+        bool ended = false;
+        for (const char ch: masked) {
+            if (ch == '(') { ++depth; continue; }
+            if (ch == ')') { if (depth > 0) --depth; continue; }
+            if (depth != 0) continue;
+            if (ch == ';') { ended = true; continue; }
+            if (ended && !std::isspace(static_cast<unsigned char>(ch))) return true;
+        }
+        return false;
     }
 } // namespace dbmw::common::sql

@@ -28,18 +28,24 @@ namespace dbmw::common::sql {
     // 仅依据结构模板计算的指纹（不含数据源名/操作类型），用于审计黑白名单匹配。
     std::uint64_t fingerprintTemplate(const std::string &sql);
 
-    // 首条语句的动词分类。多语句只取第一条。
+    // 首条语句的动词分类。WITH/CTE 会继续追踪到外层主语句，
+    // 不会把 WITH ... UPDATE/DELETE 误判为 SELECT。
     StatementKind classifyStatement(const std::string &sql);
 
-    // 是否为写操作（Insert/Update/Delete/Ddl）。
+    // 是否为写/状态变更操作（Insert/Update/Delete/Ddl/Other）。
+    // Other 包含 MERGE/CALL/SET 等无法安全当作只读的语句，保守拦截。
     bool isWrite(StatementKind kind);
 
-    // best-effort：UPDATE/DELETE 之后是否存在独立 WHERE 关键字。
-    // 仅扫描结构模板，跳过字符串/注释/标识符，避免误判。
+    // best-effort：外层 UPDATE/DELETE 是否存在独立 WHERE 关键字。
+    // 只扫描括号深度 0，CTE/子查询内的 WHERE 不算外层保护条件。
     bool hasWhereClause(const std::string &sql);
 
-    // best-effort：SELECT 之后是否存在独立 LIMIT 关键字。
+    // best-effort：外层 SELECT 是否存在独立 LIMIT 关键字。
     bool hasLimitClause(const std::string &sql);
+
+    // 是否包含不止一条可执行语句（尾部分号不算）。字符串、注释和
+    // PostgreSQL dollar-quoted 区域已被屏蔽，其中的分号不会误报。
+    bool hasMultipleStatements(const std::string &sql);
 } // namespace dbmw::common::sql
 
 #endif // DBMW_COMMON_SQL_ANALYZE_H

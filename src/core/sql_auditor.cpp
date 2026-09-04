@@ -76,6 +76,14 @@ namespace dbmw::core {
         checked_.fetch_add(1, std::memory_order_relaxed);
         using namespace common::sql;
 
+        // 轻量分析器不尝试跨语句追踪副作用。多语句若只按第一个动词
+        // 审计，"SELECT 1; DELETE ..." 就能直接绕过只读与 DML 护栏。
+        if (hasMultipleStatements(sql)) {
+            return verdict(policy->block, policy->log_blocked,
+                           "multiple SQL statements are not allowed", sql,
+                           warned_, blocked_);
+        }
+
         // 指纹要完整扫一遍 SQL，只有真配了名单才算——
         // 绝大多数人只开 no-where / limit 这类规则，不该替他们付这笔开销。
         if (policy->needsFingerprint) {
@@ -84,12 +92,14 @@ namespace dbmw::core {
             // 白名单优先：非空时"仅放行名单内"，其余一律拦截（允许列表模式）。
             if (!policy->whitelist.empty() &&
                 policy->whitelist.find(fp) == policy->whitelist.end()) {
-                return verdict(policy->block, policy->log_blocked,
+                // 允许列表是安全边界，不受用于其它启发式规则的
+                // action=warn 影响；否则“仅放行名单内”会在灰度模式下失效。
+                return verdict(true, policy->log_blocked,
                                "SQL not in audit whitelist", sql, warned_, blocked_);
             }
             // 黑名单：命中即判定。
             if (policy->blacklist.find(fp) != policy->blacklist.end()) {
-                return verdict(policy->block, policy->log_blocked,
+                return verdict(true, policy->log_blocked,
                                "SQL in audit blacklist", sql, warned_, blocked_);
             }
         }

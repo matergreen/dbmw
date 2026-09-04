@@ -285,9 +285,15 @@ namespace dbmw {
 
         // 显式关闭；幂等。BorrowedInSession 不归还连接（归 Session）。
         common::Status close() {
-            if (!impl_) return common::Status::OK();
+            if (!impl_) {
+                if (binding_ == Binding::OwnsHandle) handle_.reset();
+                return common::Status::OK();
+            }
             const auto st = impl_->close();
             impl_.reset();
+            // 独立游标显式 close 后应立即归还连接，不应等 Cursor 对象
+            // 稍后析构。会话内游标没有 handle_，连接仍归 Session 所有。
+            if (binding_ == Binding::OwnsHandle) handle_.reset();
             return st;
         }
 
@@ -522,6 +528,11 @@ namespace dbmw {
         // 写路径候选：按 failover 顺序返回未熔断（且可选健康）的可写节点。
         // 全部不可用时返回空表，由调用方决定是报错还是入写缓冲。
         [[nodiscard]] std::vector<std::shared_ptr<DataSource>> writeTargets() const;
+
+        // 只有这些错误能证明 SQL 尚未进入数据库执行阶段，才可安全
+        // 切换到下一个可写节点。执行中断线/超时的提交结果不确定，
+        // 未配合幂等去重时绝不能自动重放。
+        [[nodiscard]] static bool safeToFailoverWrite(const common::Status &status);
 
         common::Status borrowSession(std::unique_ptr<ConnectionPool::Handle> &out,
                                      std::chrono::milliseconds timeout) const;

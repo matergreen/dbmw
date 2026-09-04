@@ -199,6 +199,16 @@ public:
     }
 };
 
+// 模拟已停止/队列满的完成调度器：所有即时投递都拒绝。
+// 异步引擎必须仍然在非调用线程交付回调，不能 caller-runs。
+class RejectingCompletionExecutor final : public async::IExecutor {
+public:
+    bool tryPost(Task) override { return false; }
+    void postAfter(Task, std::chrono::milliseconds) override {}
+    void shutdown(std::chrono::milliseconds) override {}
+    [[nodiscard]] async::ExecutorStats stats() const override { return {}; }
+};
+
 // ---------------------------------------------------------------------------
 // 配置与工具
 // ---------------------------------------------------------------------------
@@ -740,7 +750,23 @@ int main() {
     }
 
     // =====================================================================
-    std::cout << "== A9. 生命周期：shutdown 排水，之后新操作被拒（T11/§9.3）==\n";
+    std::cout << "== A9. 完成调度器过载：回调仍不在调用栈内执行 ==\n";
+    {
+        async::setCompletionExecutor(std::make_shared<RejectingCompletionExecutor>());
+        const auto caller = std::this_thread::get_id();
+        std::promise<std::pair<common::Status, std::thread::id>> promise;
+        auto future = promise.get_future();
+        async::query("SELECT completion_fallback", [&promise](async::QueryResult &&r) {
+            promise.set_value({std::move(r.status), std::this_thread::get_id()});
+        });
+        const auto delivered = future.get();
+        check(delivered.first.ok() && delivered.second != caller,
+              "完成调度器拒绝投递时，保底队列异步交付回调");
+        // 后续生命周期用例仍走保底调度器，不再将已拒绝的对象留在全局。
+        async::setCompletionExecutor(nullptr);
+    }
+
+    std::cout << "== A10. 生命周期：shutdown 排水，之后新操作被拒（T11/§9.3）==\n";
     {
         AsyncMockConnection::queryDelayMs = 150;
         std::promise<async::QueryResult> pr;

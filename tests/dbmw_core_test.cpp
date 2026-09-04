@@ -2,6 +2,8 @@
 #include "dbmw/dbmw.h"
 #include "dbmw/core/connection_pool.h"
 #include "dbmw/core/idatabase_connection.h"
+#include "dbmw/core/sql_auditor.h"
+#include "dbmw/common/sql_analyze.h"
 #include "dbmw/config/config_loader.h"
 #include "dbmw/driver/driver_registry.h"
 
@@ -1420,6 +1422,120 @@ int main() {
               "热更新后的 count、累计耗时和直方图从同一批样本重新开始");
         common::Observability::clearSlowSqlStats();
         common::Observability::configure(config::ObservabilityConfig{});
+    }
+
+    std::cout << "== 44. SQL 审计：CTE/多语句/黑白名单不可绕过 ==\n";
+    {
+        using common::sql::StatementKind;
+        check(common::sql::classifyStatement(
+                  "WITH picked AS (SELECT id FROM t WHERE id=1) DELETE FROM users") ==
+              StatementKind::Delete,
+              "WITH ... DELETE 识别为写语句，不误判为 SELECT");
+        check(common::sql::classifyStatement(
+                  "WITH RECURSIVE n AS (SELECT 1) UPDATE users SET active=0") ==
+              StatementKind::Update,
+              "WITH RECURSIVE ... UPDATE 识别为写语句");
+        check(common::sql::classifyStatement(
+                  "WITH removed AS (DELETE FROM users RETURNING id) SELECT * FROM removed") ==
+              StatementKind::Delete,
+              "数据修改 CTE + 外层 SELECT 仍识别为写语句");
+        check(!common::sql::hasWhereClause(
+                  "WITH picked AS (SELECT id FROM t WHERE id=1) DELETE FROM users"),
+              "CTE 内层 WHERE 不能替外层 DELETE 过审");
+        check(common::sql::hasWhereClause("update users set active=0 where id=1"),
+              "WHERE/LIMIT 关键字扫描大小写不敏感");
+        check(!common::sql::hasLimitClause(
+                  "WITH picked AS (SELECT id FROM t LIMIT 1) SELECT * FROM picked"),
+              "CTE 内层 LIMIT 不能替外层 SELECT 过审");
+        check(common::sql::hasMultipleStatements("SELECT 1; DELETE FROM users") &&
+              !common::sql::hasMultipleStatements("SELECT ';' AS value; -- tail"),
+              "多语句可检出，字面量与尾部分号不误报");
+
+        config::SqlAuditConfig audit;
+        audit.enabled = true;
+        audit.action = "warn"; // 启发式规则灰度，名单仍是强边界
+        audit.log_blocked = false;
+        audit.blacklist_fingerprints = {
+            common::sql::fingerprintTemplate("SELECT secret FROM users")
+        };
+        core::SqlAuditor::configure(audit);
+        check(core::SqlAuditor::check("SELECT secret FROM users",
+                                      common::OperationType::Query, false).code ==
+              common::ErrorCode::SqlBlocked,
+              "action=warn 时命中黑名单仍强制拦截");
+
+        audit.blacklist_fingerprints.clear();
+        audit.whitelist_fingerprints = {
+            common::sql::fingerprintTemplate("SELECT allowed FROM users")
+        };
+        core::SqlAuditor::configure(audit);
+        check(core::SqlAuditor::check("SELECT denied FROM users",
+                                      common::OperationType::Query, false).code ==
+              common::ErrorCode::SqlBlocked,
+              "action=warn 时白名单外 SQL 仍强制拦截");
+
+        audit.action = "block";
+        audit.whitelist_fingerprints.clear();
+        core::SqlAuditor::configure(audit);
+        check(core::SqlAuditor::check("SELECT 1; DELETE FROM users",
+                                      common::OperationType::Query, false).code ==
+              common::ErrorCode::SqlBlocked,
+              "block 模式拒绝无法安全分析的多语句");
+        core::SqlAuditor::configure(config::SqlAuditConfig{});
+    }
+
+    std::cout << "== 45. 路由安全：跳过熔断副本，不重放结果不确定的写 ==\n";
+    {
+        // 先把副本熔断，组查询应直接选主库，不再触碰已知故障节点。
+        config::CircuitBreakerConfig breaker;
+        breaker.failure_threshold = 1;
+        breaker.open_interval_ms = 5000;
+        auto primaryPool = makePool(0, 1);
+        auto replicaPool = makePool(0, 1);
+        auto primary = std::make_shared<core::DataSource>(primaryPool, "safe-primary");
+        auto replica = std::make_shared<core::DataSource>(replicaPool, "broken-replica",
+                                                          config::RetryConfig{}, breaker);
+        MockConnection::queryFailuresRemaining = 1;
+        common::ResultSet ignored;
+        replica->query("SELECT open_circuit", ignored);
+        MockConnection::queryFailuresRemaining = 0;
+        core::DataSource readGroup("safe-read", primary, {replica},
+                                   std::chrono::milliseconds(0), false);
+        std::vector<std::string> readTargets;
+        common::Observability::setObserver([&](const common::OperationEvent &event) {
+            if (event.type == common::OperationType::Query)
+                readTargets.push_back(event.dataSource);
+        });
+        ignored.clear();
+        const auto readStatus = readGroup.query("SELECT healthy", ignored);
+        common::Observability::setObserver({});
+        check(readStatus.ok() && readTargets == std::vector<std::string>({"safe-primary"}),
+              "读路由跳过已熔断副本，全部不可用时直接走主库");
+
+        // 主库在执行阶段断线（SQLSTATE 08）可能已经提交。此时不得
+        // 向候选主重放，否则会双写。
+        auto candidatePool = makePool(0, 1);
+        auto candidate = std::make_shared<core::DataSource>(candidatePool, "candidate");
+        core::DataSource writeGroup("safe-write", primary, {},
+                                    std::chrono::milliseconds(0), true, nullptr, false,
+                                    {primary, candidate});
+        MockConnection::executeFailuresRemaining = 1;
+        std::vector<std::string> writeTargets;
+        common::Observability::setObserver([&](const common::OperationEvent &event) {
+            if (event.type == common::OperationType::Execute)
+                writeTargets.push_back(event.dataSource);
+        });
+        std::int64_t affected = 0;
+        const auto writeStatus = writeGroup.execute("UPDATE t SET v=1", affected);
+        common::Observability::setObserver({});
+        MockConnection::executeFailuresRemaining = 0;
+        check(!writeStatus.ok() && writeStatus.connectionBroken &&
+              writeTargets == std::vector<std::string>({"safe-primary"}),
+              "执行中断线的写结果不确定，不向候选主库自动重放");
+
+        primaryPool->shutdown(std::chrono::milliseconds(0));
+        replicaPool->shutdown(std::chrono::milliseconds(0));
+        candidatePool->shutdown(std::chrono::milliseconds(0));
     }
 
     std::cout << "\n----------------------------------------\n";

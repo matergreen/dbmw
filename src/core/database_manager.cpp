@@ -630,8 +630,14 @@ namespace dbmw::core {
         // 每个线程本地轮转，避免全局原子计数器在多核间的 false sharing 写竞争。
         // replicas_ 在 init 时定下后不再变动，读取无需加锁。
         thread_local std::uint64_t tlsRound = 0;
-        const auto index = (tlsRound++) % replicas_.size();
-        return replicas_[index];
+        const auto start = (tlsRound++) % replicas_.size();
+        for (std::size_t offset = 0; offset < replicas_.size(); ++offset) {
+            const auto &candidate = replicas_[(start + offset) % replicas_.size()];
+            if (candidate && !candidate->isCircuitOpen()) return candidate;
+        }
+        // 所有副本都在熔断时直接走主库，不要按权重继续把请求
+        // 送给已知故障节点。这是本地健康快照，复制延迟仍由外部拓扑管理。
+        return primary_;
     }
 
     void DataSource::markWrite() const {
@@ -711,6 +717,22 @@ namespace dbmw::core {
         return targets;
     }
 
+    bool DataSource::safeToFailoverWrite(const common::Status &status) {
+        switch (status.code) {
+            case common::ErrorCode::ConnectionFailed:
+                // 借连接阶段的 ConnectionFailed 只有 code/message；语句执行中
+                // 出现 SQLSTATE 08 则会携带 sqlState + connectionBroken，其提交结果不确定。
+                return !status.connectionBroken && status.sqlState.empty();
+            case common::ErrorCode::PoolExhausted:    // 未借到连接
+            case common::ErrorCode::PoolClosed:       // 池已停止，未执行
+            case common::ErrorCode::CircuitOpen:      // 熔断闸门在执行前拒绝
+            case common::ErrorCode::DriverDisabled:   // 无可用驱动
+                return true;
+            default:
+                return false;
+        }
+    }
+
     common::Status DataSource::dispatchWrite(
         const std::function<common::Status(const std::shared_ptr<DataSource> &)> &attempt,
         const std::function<common::Status()> &buffered) const {
@@ -732,8 +754,9 @@ namespace dbmw::core {
             // 只有"没能落到库上"的失败才值得换节点。
             // 唯一键冲突、语法错误这类业务失败换个节点结果一模一样，
             // 转移过去只是把同一个错误再犯一次，还凭空多了一次误写的风险。
-            if (!status.retryable && !status.connectionBroken &&
-                status.code != common::ErrorCode::CircuitOpen)
+            // 执行阶段的断线/超时存在“已提交但回包丢失”的歧义，
+            // 盲目切换节点会双写。只对可证明未执行的错误做 failover。
+            if (!safeToFailoverWrite(status))
                 return status;
         }
 
@@ -1870,6 +1893,7 @@ namespace dbmw::core {
         // 放在校验之前的话，一个配置错误会让 init 返回失败，却已经悄悄把
         // 生效中的审计策略和缓存换掉了——调用方以为回滚了，其实没有。
         SqlAuditor::configure(cfg.sql_audit);
+        configurePreparedCache(cfg.prepared_cache);
         // 热加载必须清缓存：数据源名可以不变，但它指向的库/账号/schema
         // 可能已经改了。留着旧条目就是拿 A 库的数据回答 B 库的查询。
         QueryCache::configure(cfg.query_cache);

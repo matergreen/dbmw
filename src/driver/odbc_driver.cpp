@@ -983,7 +983,7 @@ namespace dbmw::driver {
         out = std::move(cur);
         return common::Status::OK();
 #else
-        (void) sql; (void) params; (void) opts;
+        (void) sql; (void) params; (void) opts; out.reset();
         return common::Status::error(common::ErrorCode::DriverDisabled, "ODBC driver disabled");
 #endif
     }
