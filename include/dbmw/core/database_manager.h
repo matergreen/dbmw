@@ -21,7 +21,15 @@
 #include <vector>
 
 
-namespace dbmw::core {
+namespace dbmw {
+
+    // v0.2.0：异步管线引擎（实现见 src/async/async_engine.cpp）。
+    // 前向声明即可——DataSource 只需要给它 friend 访问。
+    namespace async::detail {
+        class AsyncEngine;
+    }
+
+    namespace core {
 
     // 前向声明：Session / DataSource 的 openCursor 在 Cursor 完整定义（下方）之前就以
     // std::unique_ptr<Cursor> 作参数；按引用传 unique_ptr 只需不完整类型，前置声明即可，
@@ -430,6 +438,7 @@ namespace dbmw::core {
 
     private:
         friend class DatabaseManager;
+        friend class async::detail::AsyncEngine;
 
         common::Status beforeAttempt() const;
         void afterAttempt(const common::Status &status) const;
@@ -516,6 +525,28 @@ namespace dbmw::core {
 
         common::Status borrowSession(std::unique_ptr<ConnectionPool::Handle> &out,
                                      std::chrono::milliseconds timeout) const;
+
+        // ===== v0.2.0 异步引擎接缝（AsyncEngine 专用，见 docs/async-design-v0.2.0.md §8）=====
+        //
+        // 引擎自己经 borrowAsync 借连接（零线程等待），随后用它构造会话执行。
+        // 审计已在调用线程经 preGate 过掉，这里与同步单语句路径一致传默认上下文。
+
+        // 用已借到的连接构造本数据源的会话。
+        std::unique_ptr<Session> makeSession(
+            std::unique_ptr<ConnectionPool::Handle> h) const {
+            return std::unique_ptr<Session>(new Session(std::move(h), name_));
+        }
+
+        // 本数据源（叶子）的连接池；组返回 null（引擎先经 readTarget/writeTargets
+        // 解析到叶子）。内联访问器，避免引擎直接摸 pool_ 成员。
+        [[nodiscard]] std::shared_ptr<ConnectionPool> pool() const { return pool_.lock(); }
+
+        // 结果缓存三件套（叶子语义；组上 cacheEligible 恒 false）。
+        // cacheLookup 命中返回 true 并填充 out 与 key（供成功后 cacheStore 复用）。
+        [[nodiscard]] bool cacheEligible() const;
+        bool cacheLookup(const std::string &sql, const common::Params &params,
+                         common::ResultSet &out, std::string &key) const;
+        void cacheStore(const std::string &key, const common::ResultSet &rows) const;
 
         // withSession 的真正实现。wroteOut 非空时回填"会话内是否发生过写"，
         // 供读写分离组在委托给 primary 之后做 read-after-write 标记。
@@ -623,7 +654,8 @@ namespace dbmw::core {
         std::unique_ptr<StatsReporter> statsReporter_;
     };
 
-} // namespace dbmw::core
+} // namespace core
+} // namespace dbmw
 
 
 #endif // DBMW_CORE_DATABASE_MANAGER_H

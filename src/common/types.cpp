@@ -38,6 +38,7 @@ namespace dbmw::common {
             case ErrorCode::CursorLimit:      return "CursorLimit";
             case ErrorCode::CursorError:      return "CursorError";
             case ErrorCode::Unknown:         break;
+            case ErrorCode::Overloaded:      return "Overloaded";
         }
         return "Unknown";
     }

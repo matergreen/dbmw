@@ -309,6 +309,25 @@ namespace dbmw::config {
         }
     }
 
+    // ---- 异步执行器 ----
+    if (j.contains("async")) {
+        if (!j["async"].is_object()) {
+            error = "async must be an object";
+            return false;
+        }
+        const auto &as = j["async"];
+        out.async.enabled = as.value("enabled", out.async.enabled);
+        out.async.threads = as.value("threads", out.async.threads);
+        out.async.queue_size = as.value("queue_size", out.async.queue_size);
+        out.async.statement_timeout_ms = as.value(
+            "statement_timeout_ms", out.async.statement_timeout_ms);
+        if (out.async.threads < 0 || out.async.queue_size < 1 ||
+            out.async.statement_timeout_ms < 0) {
+            error = "invalid async configuration";
+            return false;
+        }
+    }
+
         if (!j.contains("datasources") || !j["datasources"].is_array()) {
             error = "missing 'datasources' array";
             return false;

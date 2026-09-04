@@ -57,10 +57,12 @@ include/dbmw/
              connection_pool.h     heartbeat_manager.h  database_manager.h
   driver/    idriver.h  driver_registry.h  driver_factory.h
              mysql_driver.h  postgres_driver.h  odbc_driver.h
+  async/     async_types.h(results/Handle)  executor.h(IExecutor/thread pool)
+             dbmw_async.h(async facade)  task.h(coroutine layer, optional C++20)
   dbmw.h     (public facade)
 src/         corresponding implementations
-tests/       dbmw_core_test.cpp (behavioral tests on a mock driver, no external dependencies)
-examples/    basic_usage.cpp
+tests/       dbmw_core_test.cpp  dbmw_async_test.cpp  dbmw_coro_test.cpp(coro=ON)
+examples/    basic_usage.cpp  async_example.cpp
 config/      datasources.json.example
 third_party/nlohmann/json.hpp  (vendored single-header, works offline)
 scripts/     setup-wsl.sh
@@ -81,6 +83,8 @@ mkdir -p build && cd build
 cmake ..                                   # core layer only
 # Enable drivers example:
 # cmake .. -DDBMW_ENABLE_MYSQL=ON -DDBMW_ENABLE_POSTGRES=ON -DDBMW_ENABLE_ODBC=ON
+# Enable the coroutine layer (optional; only task.cpp is bumped to C++20):
+# cmake .. -DDBMW_ENABLE_ASYNC_CORO=ON
 cmake --build .
 
 # 3) Run the example (loads config and queries; with drivers disabled you get a DriverDisabled message)
@@ -560,6 +564,70 @@ In `observer.cpp`, slow-SQL aggregation: when a statement is judged slow it is a
 - **`StreamParams` (large-parameter streaming) and cursors deliberately bypass the result cache**: streamed content is not a fixed value and cannot participate in `cacheKey` (which requires identical params → identical result); auditing still classifies by SQL text and streamed content never enters logs.
 - **The generated-keys path bypasses the prepared cache**: `executePrepared` cannot capture the `RETURNING` result set; saving one prepare at the cost of silently hiding the primary key from the caller would be putting the cart before the horse.
 - **Write buffer / connection-pool TTL** are object-lifecycle expiries, not KV caches.
+
+## Async API (v0.2.0: callbacks / futures / coroutines)
+
+The three calling styles share one execution pipeline — governance gates (audit / rate limit / circuit breaker / cache), retry backoff, statement timeout, cancellation — and differ only in how results are delivered. Enable `async` in the config:
+
+```json
+{ "async": { "enabled": true, "threads": 4, "queue_size": 4096 } }
+```
+
+`threads` is the worker count (0 = hardware_concurrency); one extra timer thread drives retry backoff and timeout checks. When the queue is full, new operations fail fast with `Overloaded` (explicit backpressure, not implicit queueing). `DBMW::shutdown` rejects new operations, waits for in-flight ones to finish, then stops the executors and the pools.
+
+**Callback style (hot path)** — completion callbacks are delivered by the completion executor, never on the caller's stack; the returned `Handle` supports cancellation:
+
+```cpp
+dbmw::async::Options opts;
+opts.timeout = std::chrono::milliseconds(2000);   // overall statement deadline
+auto h = dbmw::async::query("SELECT id FROM users WHERE age > ?",
+                            {dbmw::common::Value(std::int64_t(18))},
+    [](dbmw::async::QueryResult &&r) {            // runs on the completion executor; keep it short
+        if (r.status.ok()) useRows(std::move(r.rows));
+    }, opts);
+// To give up mid-flight: h.cancel() — Queued never touches the pool;
+// Running forwards a best-effort driver cancel
+```
+
+**Future style (convenience)** — no cancellation (use the callback style with a `Handle` if you need it); dropping a future without consuming it is legal:
+
+```cpp
+auto fut = dbmw::async::execute("UPDATE users SET active = 1 WHERE id = ?",
+                                {dbmw::common::Value(std::int64_t(7))});
+auto r = fut.get();   // r.status / r.affected
+```
+
+**Coroutine style (optional, C++20)** — a lazy `Task` that starts only on `co_await`; destroying an un-awaited task is a safe no-op. Governance / retry / cancellation / timeout are identical to the callback style; coroutines always resume on the completion executor thread:
+
+```bash
+cmake .. -DDBMW_ENABLE_ASYNC_CORO=ON   # only task.cpp is bumped to C++20; the rest stays C++17
+```
+
+```cpp
+#include "dbmw/async/task.h"   // the including TU must be compiled as C++20
+
+dbmw::async::Task<void> demo() {
+    auto q = co_await dbmw::async::queryAsync(
+        "SELECT id FROM users WHERE age > ?", {dbmw::common::Value(std::int64_t(18))});
+    if (q.status.ok()) useRows(std::move(q.rows));
+
+    auto tx = co_await dbmw::async::transactionAsync({}, [](dbmw::core::Session &s) {
+        std::int64_t n = 0;
+        return s.execute("UPDATE users SET active = 1", n);  // non-OK rolls back
+    });
+}
+
+dbmw::async::run(demo());   // controlled fire-and-forget: the frame destroys itself on completion
+```
+
+**Custom executor (asio integration)**: inject an `IExecutor` adapter via `dbmw::async::setExecutor(...)`; completion callbacks and coroutine resumes then happen on your own event-loop threads (adapter sketch in segment 5 of `examples/async_example.cpp`).
+
+Constraints and caveats:
+
+- Callbacks and transaction lambdas run on workers: keep them short and thread-safe. **Never call `dbmw::async::*` inside a transaction lambda** — nested async can deadlock on a small pool; use the synchronous `Session` methods directly.
+- An uncaught exception inside a top-level coroutine started by `run()` terminates the process (never silently swallowed); handle exceptions inside the coroutine or propagate them via `co_await` to an enclosing `try/catch`.
+- Do not write coroutine bodies as lambdas capturing locals — the closure temporary dies before the async operation completes and the captures dangle; use named functions returning `Task`.
+- Full design (drain order, timeout semantics, consistency test matrix): `docs/async-design-v0.2.0.md`.
 
 ## Observability
 

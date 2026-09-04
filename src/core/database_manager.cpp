@@ -840,6 +840,24 @@ namespace dbmw::core {
         return common::Status::OK();
     }
 
+    // ===== v0.2.0 异步引擎接缝：结果缓存（叶子语义，与 queryUngated 的判定同源）=====
+
+    bool DataSource::cacheEligible() const {
+        return !primary_ && QueryCache::enabled() &&
+            (!QueryCache::replicaOnly() || readReplica_);
+    }
+
+    bool DataSource::cacheLookup(const std::string &sql, const common::Params &params,
+                                 common::ResultSet &out, std::string &key) const {
+        if (!cacheEligible()) return false;
+        key = cacheKey(sql, params);
+        return QueryCache::get(name_, key, out);
+    }
+
+    void DataSource::cacheStore(const std::string &key, const common::ResultSet &rows) const {
+        if (!primary_ && QueryCache::enabled()) QueryCache::put(name_, key, rows);
+    }
+
     common::Status DataSource::query(const std::string &sql, common::ResultSet &out) const
     {
         if (const auto g = preGate(sql, common::OperationType::Query); !g.ok()) return g;

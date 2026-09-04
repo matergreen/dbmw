@@ -8,6 +8,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -15,6 +17,21 @@
 
 
 namespace dbmw::core {
+    // 异步借出的投递通道：由 async 层在调用 borrowAsync 时注入。
+    //
+    // 刻意不直接依赖 dbmw::async::IExecutor（两个 std::function 足够），
+    // 避免 core 反向依赖 async 模块——池只关心"任务去哪跑、回调去哪投"，
+    // 不关心线程池本身。
+    struct AsyncIo {
+        // 在执行器线程上跑阻塞 IO（建连 / ping）。必须不抛异常。
+        std::function<void(std::function<void()>)> post;
+        // 投递完成回调。保证不在池锁内、不在发起调用的栈上执行（I1 不变量）。
+        // 必须不抛异常。
+        std::function<void(std::function<void()>)> deliver;
+
+        [[nodiscard]] bool usable() const { return static_cast<bool>(post) && static_cast<bool>(deliver); }
+    };
+
     // 单个数据源的连接池，线程安全。
     //
     // 用法：通过 borrow() 获取一个 RAII 句柄 Handle；句柄析构时自动归还连接。
@@ -27,7 +44,7 @@ namespace dbmw::core {
     // 生命周期：池的可变状态放在 shared_ptr<State> 中，Handle 只持有
     // weak_ptr<State>。因此即使池先被销毁，仍在栈上的 Handle 析构时也不会
     // 触碰已释放内存——它会直接关闭自己那条连接。
-    class ConnectionPool {
+    class ConnectionPool : public std::enable_shared_from_this<ConnectionPool> {
         // 池的可变状态，独立于 ConnectionPool 对象存在，
         // 使已借出的 Handle 在池销毁后仍能安全收尾。完整定义在下方私有段。
         struct State;
@@ -55,6 +72,8 @@ namespace dbmw::core {
             std::uint64_t lifetimeEvictions = 0;
             std::chrono::microseconds totalBorrowWait{0};
             std::chrono::microseconds maxBorrowWait{0};
+            // 异步等待者队列当前长度（v0.2.0；追加在末尾保证旧代码聚合初始化兼容）。
+            std::size_t asyncWaiting = 0;
             [[nodiscard]] double utilization() const {
                 return maxConnections == 0 ? 0.0
                     : static_cast<double>(borrowed) / static_cast<double>(maxConnections);
@@ -151,6 +170,24 @@ namespace dbmw::core {
         // 便捷重载：只取错误描述，错误码可从返回的 Status 里另行判断。
         std::unique_ptr<Handle> borrow(std::string &error) const;
 
+        // 异步借出（v0.2.0）：在任何线程调用都立即返回，绝不阻塞。
+        //
+        // 结果（含失败）经 io.deliver 投递到 io 指定的线程上执行——既不在
+        // 池锁内、也不在调用栈上（I1 不变量）。决策表：
+        //   - 池已关闭            → complete(nullptr, PoolClosed)
+        //   - idle 有新鲜连接      → 直接交付（免 ping）
+        //   - idle 有过期/待校验连接 → io.post 一个 ping 任务，活着交付、
+        //                            死了递归走建连/入队
+        //   - idle 空且 total < max → io.post 一个建连任务（占位后回滚或交付）
+        //   - idle 空且 total == max → 挂入等待者队列，归还时直接交接；
+        //                            deadline 到点由健康检查/归还路径清理，
+        //                            交付 PoolExhausted
+        // timeout 语义与 borrow() 一致：<0 = 池默认；0 = 不等待。
+        // io 与 complete 会被拷贝进等待者（若入队），必须保持轻量且自包含。
+        void borrowAsync(std::chrono::milliseconds timeout,
+                         const AsyncIo &io,
+                         std::function<void(std::unique_ptr<Handle>, common::Status)> complete) const;
+
         // 心跳调用：检查空闲连接健康度，失效的丢弃，并补足到 min。
         // 所有 ping / connect 都在锁外执行，不会阻塞业务线程借出连接。
         void healthCheck() const;
@@ -174,7 +211,10 @@ namespace dbmw::core {
     private:
         // 池的可变状态。独立于 ConnectionPool 对象存在，
         // 使已借出的 Handle 在池销毁后仍能安全收尾。
-        struct State {
+        //
+        // 继承 enable_shared_from_this：归还路径的"直接交接"要在 State 方法里
+        // 构造 Handle（其构造函数需要 weak_ptr<State>），只有从这里才拿得到。
+        struct State : std::enable_shared_from_this<State> {
             struct IdleConnection {
                 std::unique_ptr<IDatabaseConnection> conn;
                 std::chrono::steady_clock::time_point createdAt;
@@ -182,6 +222,15 @@ namespace dbmw::core {
                 // 上次 ping 校验时刻；借出时距此刻不足 validationInterval 就跳过
                 // ping（省一次 RTT）。默认 epoch，保证刚建好的连接首次借出必校验。
                 std::chrono::steady_clock::time_point lastValidated{};
+            };
+
+            // 异步借出等待者：池满时挂起（不占任何线程），
+            // 归还路径直接把连接交给队首等待者（跳过 idle 队列与借出 ping）。
+            struct AsyncWaiter {
+                std::chrono::steady_clock::time_point enqueuedAt;
+                std::chrono::steady_clock::time_point deadline;
+                std::function<void(std::unique_ptr<Handle>, common::Status)> complete;
+                AsyncIo io;
             };
 
             std::mutex mtx;
@@ -216,6 +265,8 @@ namespace dbmw::core {
             std::uint64_t lifetimeEvictions = 0;
             std::chrono::microseconds totalBorrowWait{0};
             std::chrono::microseconds maxBorrowWait{0};
+            // 异步等待者队列（FIFO + 各自带 deadline）。
+            std::deque<AsyncWaiter> asyncWaiters;
 
             // 归还连接。池已关闭时直接关闭连接，不再入池。
             void returnConn(std::unique_ptr<IDatabaseConnection> conn,
@@ -227,6 +278,16 @@ namespace dbmw::core {
         // 建立一条新连接（网络 IO）。失败时填充 code/error 返回 nullptr。
         std::unique_ptr<IDatabaseConnection> createConnection(common::ErrorCode &code,
                                                              std::string &error) const;
+
+        // 清理已过期的异步等待者：锁内弹出并组装错误（快照 total/borrowed），
+        // 锁外经 io.deliver 投递 PoolExhausted。由健康检查与 borrowAsync 搭便车调用。
+        void expireWaiters() const;
+
+        // 投递建连任务到 io.post：网络 IO 全程锁外。slotReserved 表示调用方
+        // 是否已预定了池名额（池化模式 ++total；非池化模式传 false）。
+        void postCreateTask(const AsyncIo &io,
+                            std::function<void(std::unique_ptr<Handle>, common::Status)> complete,
+                            bool slotReserved) const;
 
         std::shared_ptr<State> state_;
         std::unique_ptr<driver::IDriver> driver_;

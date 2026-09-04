@@ -206,7 +206,11 @@ namespace dbmw::common {
         CursorClosed,      // 在已关闭/已移动的游标上调用 fetch/fetchRow（EOF 或 reuse 后）
         CursorLimit,       // 超过 max_open_cursors，拒绝开新游标（调用方应等待/降级）
         CursorError,       // 游标底层错误（驱动/服务端游标相关）
-        Unknown
+        Unknown,
+        // 异步执行器的有界队列已满，操作被快速拒绝（显式背压信号，可重试）。
+        // 追加在枚举末尾是项目既有约定：不得在中间插入值，否则已序列化的
+        // 数值会整体漂移（见 observer.h 的同类说明）。
+        Overloaded
     };
 
     // 错误码 -> 稳定字符串（便于日志与跨语言边界传递）。

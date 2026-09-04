@@ -250,6 +250,21 @@ namespace dbmw::config {
         int weight = 1;
     };
 
+    // 异步执行器（v0.2.0 异步 API 的运行时底座）。
+    //
+    // 执行器承载所有驱动的阻塞 IO：调用线程提交异步操作后立即返回，
+    // "借连接 + 执行语句"全部发生在执行器线程上。
+    // 线程惰性启动——进程从未使用异步 API 就不会多出任何线程。
+    struct AsyncConfig {
+        bool enabled = true;
+        // 执行器 worker 线程数；0 = hardware_concurrency。
+        int threads = 0;
+        // 立即任务队列上限；满时新操作以 Overloaded 快速失败（显式背压）。
+        int queue_size = 4096;
+        // 全局默认语句期限（毫秒）；0 = 不限。可被每次调用的 Options::timeout 覆盖。
+        int statement_timeout_ms = 0;
+    };
+
     struct DataSourceGroupConfig {
         std::string name;
         std::string primary;
@@ -274,6 +289,7 @@ namespace dbmw::config {
         QueryCacheConfig query_cache;
         CursorConfig cursor;                 // 游标能力开关与上限
         PreparedCacheConfig prepared_cache;  // 预编译语句复用（连接级句柄缓存）
+        AsyncConfig async;                   // 异步执行器（v0.2.0）
         std::vector<DataSourceConfig> datasources;
         std::vector<DataSourceGroupConfig> groups;
     };

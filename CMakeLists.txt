@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(dbmw VERSION 0.1.0 LANGUAGES CXX)
+project(dbmw VERSION 0.2.0 LANGUAGES CXX)
 
 # 生成 compile_commands.json，便于 CLion/clangd/VS Code 正确解析
 # 工程的 include 路径与编译选项（消除“找不到头文件”类误报）。
@@ -19,9 +19,13 @@ endif()
 # ---------------------------------------------------------------------------
 option(DBMW_ENABLE_MYSQL    "Build MySQL driver (needs libmysqlclient)"      OFF)
 option(DBMW_ENABLE_POSTGRES "Build PostgreSQL driver (needs libpqxx + libpq)" OFF)
-option(DBMW_ENABLE_ODBC     "Build ODBC driver for SQL Server/Oracle"         ON)
+option(DBMW_ENABLE_ODBC     "Build ODBC driver for SQL Server/Oracle"         OFF)
 option(DBMW_BUILD_EXAMPLES  "Build example programs"                          OFF)
 option(DBMW_BUILD_TESTS     "Build core behaviour tests (no external deps)"   OFF)
+# 协程层（设计 §5.3）：仅 src/async/task.cpp 一个 TU 被提标到 C++20，
+# 库内其余源文件仍按 C++17 编译。宏以 PUBLIC 定义导出，下游包含
+# dbmw/async/task.h 的 TU 会拿到同一开关（且必须自行以 C++20 编译）。
+option(DBMW_ENABLE_ASYNC_CORO "Build the C++20 coroutine layer (task.h)"     OFF)
 
 # ---------------------------------------------------------------------------
 # nlohmann/json：vendored 单头文件离线可用。为让安装后的 dbmw 包自包含
@@ -71,6 +75,8 @@ set(DBMW_SOURCES
     src/common/sql_analyze.cpp
     src/config/datasource_config.cpp
     src/config/config_loader.cpp
+    src/async/executor.cpp
+    src/async/async_engine.cpp
     src/core/idatabase_connection.cpp
     src/core/connection_pool.cpp
     src/core/heartbeat_manager.cpp
@@ -87,11 +93,33 @@ set(DBMW_SOURCES
     src/dbmw.cpp
 )
 
-add_library(dbmw STATIC ${DBMW_SOURCES})
+# 协程层：独立 OBJECT 库，单独提标 C++20。
+# 不能用源文件级 CXX_STANDARD 属性——那是目标属性，CMake 不支持按 TU 覆盖
+# （实测被目标级 C++17 吞掉）。OBJECT 库的产物直接并入 libdbmw.a，
+# 不产生链接依赖，install(EXPORT) 无需导出它。
+if(DBMW_ENABLE_ASYNC_CORO)
+    add_library(dbmw_coro OBJECT src/async/task.cpp)
+    target_include_directories(dbmw_coro PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+    set_target_properties(dbmw_coro PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    target_compile_definitions(dbmw_coro PRIVATE DBMW_ENABLE_ASYNC_CORO=1)
+    set(DBMW_CORO_OBJ "$<TARGET_OBJECTS:dbmw_coro>")
+else()
+    set(DBMW_CORO_OBJ "")
+endif()
+
+add_library(dbmw STATIC ${DBMW_SOURCES} ${DBMW_CORO_OBJ})
 target_include_directories(dbmw PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(dbmw PUBLIC nlohmann_json)
+if(DBMW_ENABLE_ASYNC_CORO)
+    # PUBLIC：下游包含 dbmw/async/task.h 的 TU 拿到同一开关，
+    # 且必须自行以 C++20 编译（MSVC 下自动带入 <coroutine> 所需开关，
+    # GCC/Clang 10+ 无需额外 flag）。
+    target_compile_definitions(dbmw PUBLIC DBMW_ENABLE_ASYNC_CORO=1)
+endif()
 
 # ---------------------------------------------------------------------------
 # 各驱动的可选依赖链接

@@ -39,28 +39,35 @@ jobs:
       matrix:
         include:
           # ---------------- Linux x86_64：gcc 与 clang 各一套，三驱动全开 ----------------
-          - { os: ubuntu-24.04,     pkg: linux-x86_64-gcc,   drivers: 'ON',  tests: true,
+          - { os: ubuntu-24.04,     pkg: linux-x86_64-gcc,   drivers: 'ON',  tests: true, coro: 'OFF',
               cc: gcc,   cxx: g++ }
-          - { os: ubuntu-24.04,     pkg: linux-x86_64-clang, drivers: 'ON',  tests: true,
+          - { os: ubuntu-24.04,     pkg: linux-x86_64-clang, drivers: 'ON',  tests: true, coro: 'OFF',
               cc: clang, cxx: clang++ }
 
           # ---------------- Linux arm64 ----------------
           # GitHub 对公开仓库免费提供 ARM runner；私有仓库需付费。
           # 若提示 runner 不存在，直接删掉这一行。
-          - { os: ubuntu-24.04-arm, pkg: linux-aarch64-gcc,  drivers: 'ON',  tests: true,
+          - { os: ubuntu-24.04-arm, pkg: linux-aarch64-gcc,  drivers: 'ON',  tests: true, coro: 'OFF',
               cc: gcc,   cxx: g++ }
 
           # ---------------- macOS ----------------
           # 托管 runner 现在只有 arm64 机器（macos-14 / macos-15），Homebrew 装出来的
           # 也只有 arm64 库，因此 x86_64 包无法在这里交叉编译（链接必然架构不匹配）。
           # 需要 Intel Mac 的包：用自托管 runner，或让用户按 README 本地构建。
-          - { os: macos-14,         pkg: macos-arm64-clang,  drivers: 'ON',  tests: true,
+          - { os: macos-14,         pkg: macos-arm64-clang,  drivers: 'ON',  tests: true, coro: 'OFF',
               cc: clang, cxx: clang++ }
 
           # ---------------- Windows ----------------
           # runner 上没有 libpqxx / libmysqlclient；且 CMakeLists 里 ODBC 走
           # find_library(NAMES odbc)，MSVC 下找不到会 FATAL_ERROR，故只编核心层。
-          - { os: windows-latest,   pkg: windows-x86_64-msvc, drivers: 'OFF', tests: true }
+          - { os: windows-latest,   pkg: windows-x86_64-msvc, drivers: 'OFF', tests: true, coro: 'OFF' }
+
+          # ---------------- 协程层（设计 §5.3 / 风险 R8）----------------
+          # DBMW_ENABLE_ASYNC_CORO=ON：只编译核心层 + 只跑 T15 协程测试，
+          # 不重复全量测试（与常规位互为补充，验证各编译器的 C++20 协程支持）。
+          - { os: ubuntu-24.04,     pkg: linux-x86_64-gcc-coro,   drivers: 'OFF', tests: true, coro: 'ON',
+              cc: gcc,   cxx: g++ }
+          - { os: windows-latest,   pkg: windows-x86_64-msvc-coro, drivers: 'OFF', tests: true, coro: 'ON' }
 
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +108,7 @@ jobs:
             -DDBMW_ENABLE_MYSQL=${{ matrix.drivers }} \
             -DDBMW_ENABLE_POSTGRES=${{ matrix.drivers }} \
             -DDBMW_ENABLE_ODBC=${{ matrix.drivers }} \
+            -DDBMW_ENABLE_ASYNC_CORO=${{ matrix.coro }} \
             -DDBMW_BUILD_EXAMPLES=ON \
             -DDBMW_BUILD_TESTS=ON
 
@@ -112,15 +120,23 @@ jobs:
             -DDBMW_ENABLE_MYSQL=${{ matrix.drivers }} `
             -DDBMW_ENABLE_POSTGRES=${{ matrix.drivers }} `
             -DDBMW_ENABLE_ODBC=${{ matrix.drivers }} `
+            -DDBMW_ENABLE_ASYNC_CORO=${{ matrix.coro }} `
             -DDBMW_BUILD_EXAMPLES=ON `
             -DDBMW_BUILD_TESTS=ON
 
       - name: 编译
         run: cmake --build build --config Release -j
 
+      # coro=ON 位只跑 T15 协程测试，不重复全量测试
       - name: 测试
         if: matrix.tests
-        run: ctest --test-dir build -C Release --output-on-failure
+        shell: bash
+        run: |
+          if [ "${{ matrix.coro }}" = "ON" ]; then
+            ctest --test-dir build -C Release -R dbmw_coro_test --output-on-failure
+          else
+            ctest --test-dir build -C Release --output-on-failure
+          fi
 
       # ----------------------------------------------------------- 安装打包
       - name: 安装到 dist

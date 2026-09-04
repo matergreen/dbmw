@@ -60,10 +60,12 @@ include/dbmw/
              connection_pool.h     heartbeat_manager.h  database_manager.h
   driver/    idriver.h  driver_registry.h  driver_factory.h
              mysql_driver.h  postgres_driver.h  odbc_driver.h
+  async/     async_types.h(结果体/Handle)  executor.h(IExecutor/线程池)
+             dbmw_async.h(异步门面)  task.h(协程层，可选 C++20)
   dbmw.h     (对外门面)
 src/         对应实现
-tests/       dbmw_core_test.cpp (基于 mock 驱动的行为测试，无外部依赖)
-examples/    basic_usage.cpp
+tests/       dbmw_core_test.cpp  dbmw_async_test.cpp  dbmw_coro_test.cpp(coro=ON)
+examples/    basic_usage.cpp  async_example.cpp
 config/      datasources.json.example
 third_party/nlohmann/json.hpp  (vendored 单头，离线可用)
 scripts/     setup-wsl.sh
@@ -84,6 +86,8 @@ mkdir -p build && cd build
 cmake ..                                   # 仅核心层
 # 启用驱动示例：
 # cmake .. -DDBMW_ENABLE_MYSQL=ON -DDBMW_ENABLE_POSTGRES=ON -DDBMW_ENABLE_ODBC=ON
+# 启用协程层（可选，仅 task.cpp 提标 C++20）：
+# cmake .. -DDBMW_ENABLE_ASYNC_CORO=ON
 cmake --build .
 
 # 3) 运行示例（演示加载配置与查询；默认驱动未启用会得到 DriverDisabled 提示）
@@ -602,6 +606,69 @@ cur->close();   // 显式归还连接；不调也会在析构时关 + 还
 - **`StreamParams`（大参数流式）和游标刻意不进结果缓存**：流式内容不是定值，无法参与 `cacheKey`（要求同参数必得同结果）；审计照常按 SQL 文本分类、流内容绝不进日志。
 - **生成键路径不进预编译缓存**：`executePrepared` 拿不到 `RETURNING` 的结果集，为省一次 prepare 让调用方静默拿不到主键是本末倒置。
 - **写缓冲 / 连接池的 TTL** 是对象生命周期过期，非 KV 缓存。
+
+## 异步 API（v0.2.0：回调 / future / 协程）
+
+三种调用形态共享同一条执行管线——治理闸门（审计/限流/熔断/缓存）、重试退避、语句超时、取消——只是结果交付方式不同。在配置中开启 `async`：
+
+```json
+{ "async": { "enabled": true, "threads": 4, "queue_size": 4096 } }
+```
+
+`threads` 是 worker 数（0 = hardware_concurrency），另有 1 个 timer 线程负责重试退避与超时检查；队列满时新操作以 `Overloaded` 快速失败（显式背压，不是隐式排队）。`DBMW::shutdown` 会先拒绝新操作、等在途操作归零后再停执行器与连接池。
+
+**回调式（热路径）**——完成回调由完成调度器投递，绝不在调用栈上执行；返回的 `Handle` 支持取消：
+
+```cpp
+dbmw::async::Options opts;
+opts.timeout = std::chrono::milliseconds(2000);   // 语句整体期限（兜底）
+auto h = dbmw::async::query("SELECT id FROM users WHERE age > ?",
+                            {dbmw::common::Value(std::int64_t(18))},
+    [](dbmw::async::QueryResult &&r) {            // 跑在完成调度器线程，须短小
+        if (r.status.ok()) useRows(std::move(r.rows));
+    }, opts);
+// 需要中途放弃时：h.cancel() —— Queued 不碰池；Running 尽力转发驱动 cancel
+```
+
+**future 式（便利形态）**——无取消能力（需要取消用回调式拿 `Handle`）；未取值即析构是合法用法：
+
+```cpp
+auto fut = dbmw::async::execute("UPDATE users SET active = 1 WHERE id = ?",
+                                {dbmw::common::Value(std::int64_t(7))});
+auto r = fut.get();   // r.status / r.affected
+```
+
+**协程式（可选，C++20）**——惰性 `Task`，`co_await` 时才启动；未 `co_await` 直接析构 = 安全放弃。治理/重试/取消/超时与回调形态完全同源，协程恢复线程 = 完成调度器线程：
+
+```bash
+cmake .. -DDBMW_ENABLE_ASYNC_CORO=ON   # 仅 task.cpp 提标 C++20，其余 TU 仍为 C++17
+```
+
+```cpp
+#include "dbmw/async/task.h"   // 本 TU 必须以 C++20 编译
+
+dbmw::async::Task<void> demo() {
+    auto q = co_await dbmw::async::queryAsync(
+        "SELECT id FROM users WHERE age > ?", {dbmw::common::Value(std::int64_t(18))});
+    if (q.status.ok()) useRows(std::move(q.rows));
+
+    auto tx = co_await dbmw::async::transactionAsync({}, [](dbmw::core::Session &s) {
+        std::int64_t n = 0;
+        return s.execute("UPDATE users SET active = 1", n);  // 非 Ok 自动回滚
+    });
+}
+
+dbmw::async::run(demo());   // 受控 fire-and-forget：跑完自毁，不悬垂
+```
+
+**自定义执行器（asio 接入）**：`dbmw::async::setExecutor(...)` 注入 `IExecutor` 适配器后，完成回调与协程恢复发生在你自己的事件循环线程上（适配器形状见 `examples/async_example.cpp` 第 5 段）。
+
+约束与注意：
+
+- 回调与事务 fn 跑在 worker 上，须短小、线程安全；**事务 fn 内部禁止调用 `dbmw::async::*`**（池偏小时互相等连接造成活锁），直接用同步 `Session` 方法。
+- `run()` 启动的顶层协程内未捕获异常会 `terminate`（不静默吞掉）；异常应协程内处理，或经 `co_await` 链传给有 `try/catch` 的外层。
+- 协程体不要用捕获局部引用的 lambda——闭包临时对象先于异步完成销毁，捕获会悬垂；用具名函数返回 `Task`。
+- 完整设计（含排水顺序、超时判定与一致性测试矩阵）见 `docs/async-design-v0.2.0.md`。
 
 ## 可观测性
 

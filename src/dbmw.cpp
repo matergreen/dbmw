@@ -1,4 +1,5 @@
 #include "dbmw/dbmw.h"
+#include "dbmw/async/dbmw_async.h"
 #include "dbmw/config/config_loader.h"
 
 #include <chrono>
@@ -37,7 +38,13 @@ namespace dbmw {
         if (!config::ConfigLoader::loadFromFile(configPath, cfg, err)) {
             return common::Status::error(common::ErrorCode::ConfigError, err);
         }
-        return mgr().init(cfg);
+        const auto st = mgr().init(cfg);
+        // 异步执行器在核心初始化成功后接线（v0.2.0 §9.1）。
+        // 放在 dbmw.cpp 而非 DatabaseManager::init：core 不反向依赖 async
+        // （与 ConnectionPool::AsyncIo 的设计一致）。线程惰性启动，
+        // 未使用异步的进程零额外线程。
+        if (st.ok()) async::detail::initEngine(cfg.async);
+        return st;
     }
 
     common::Status DBMW::reload(const std::string &configPath,
@@ -47,7 +54,11 @@ namespace dbmw {
         if (!config::ConfigLoader::loadFromFile(configPath, cfg, error)) {
             return common::Status::error(common::ErrorCode::ConfigError, error);
         }
-        return mgr().init(cfg, grace);
+        const auto st = mgr().init(cfg, grace);
+        // 热加载不重建线程池（initEngine 内部保留既有执行器）；
+        // 只更新全局默认语句期限。
+        if (st.ok()) async::detail::initEngine(cfg.async);
+        return st;
     }
 
     common::Status DBMW::query(const std::string &sql, common::ResultSet &out) {
@@ -214,6 +225,13 @@ namespace dbmw {
     }
 
     void DBMW::shutdown(const std::chrono::milliseconds grace) {
+        // 异步排水必须在池关闭之前（v0.2.0 §9.3，顺序是正确性问题）：
+        //   1) 拒绝新异步操作（PoolClosed）
+        //   2) 等在途操作归零
+        //   3) 停完成调度器（已投递的回调排空）
+        //   4) 停主执行器（worker 排空任务）
+        // 在途操作归还连接前池必须活着，所以池的关闭仍在 mgr().shutdown 里。
+        async::detail::drainAndStop(grace);
         mgr().shutdown(grace);
     }
 
