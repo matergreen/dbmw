@@ -50,9 +50,15 @@ namespace {
 // 协程体：必须是具名函数（或生命周期明确的仿函数），不要用捕获局部引用的
 // lambda 协程——闭包临时对象先于异步完成销毁，捕获会悬垂。
 dbmw::async::Task<void> coroDemo() {
+    // GCC 13 已知缺陷（PR109227 系）：co_await 表达式的实参里出现非平凡的
+    // 花括号临时（如 {Value(...)}）会触发编译器内部错误（ICE）。规避：参数
+    // 先具名构造再传入。GCC 14+ / Clang / MSVC 不受影响。
+    dbmw::common::Params params;
+    params.push_back(dbmw::common::Value(std::int64_t(1)));
+
     // co_await 挂起 → 回调式 query 在引擎内推进 → 完成调度器线程恢复本协程。
     auto q = co_await dbmw::async::queryAsync(
-        "SELECT id, name FROM users WHERE id = ?", {dbmw::common::Value(std::int64_t(1))});
+        "SELECT id, name FROM users WHERE id = ?", params);
 
     if (q.status.ok()) {
         std::cout << "[OK]   协程式 query 返回 " << q.rows.rowCount() << " 行" << std::endl;

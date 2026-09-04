@@ -537,14 +537,17 @@ int main() {
         // --- 熔断：语义对齐同步测试 #22（阈值 2、半开恢复）---
         // remaining=2 时第一次查询的重试中途熔断打开（attempt1/2 各计一次失败，
         // 第 3 次尝试被逐尝试闸门拦下）→ CircuitOpen 且恰好 2 次驱动调用。
-        // open_interval 取 100ms ≫ 两次退避（~40ms）：保证重试期间熔断不过期；
-        // 随后冷却 150ms > 100ms，下一次查询作为半开探测放行。
+        // open_interval 取 2000ms：两次退避名义 ~40ms，但慢 runner（macOS 托管
+        // 机调度抖动大）上重试间隔可膨胀到数百 ms——窗口必须远大于最坏重试
+        // 间隔，否则熔断在重试结束前过期转半开、探测放行（实测踩过：100ms
+        // 窗口在 macOS CI 上 calls=3 且收尾 Ok）。随后冷却 2100ms > 2000ms，
+        // 下一次查询作为半开探测放行。
         CfgFlags cf = base;
         cf.circuitThreshold = 2;
-        cf.circuitOpenMs = 100;
+        cf.circuitOpenMs = 2000;
         applyConfig(cf);
         check(DBMW::reload(g_configPath, std::chrono::milliseconds(500)).ok(),
-              "热加载开启熔断（阈值 2，开放 100ms）");
+              "热加载开启熔断（阈值 2，开放 2000ms）");
         AsyncMockConnection::queryCalls = 0;
         AsyncMockConnection::queryFailuresRemaining = 2;
         auto f1 = awaitResult(async::query("SELECT cb"), 8000);
@@ -566,8 +569,9 @@ int main() {
               AsyncMockConnection::queryCalls == 0,
               "熔断开放期间异步查询快速失败且零驱动调用");
         check(ms < 500, "快速失败（实测 " + std::to_string(ms) + "ms）");
-        // 冷却 150ms > 开放 100ms：下一次查询作为半开探测放行。
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        // 冷却 2500ms > 开放 2000ms（留出 f1 收尾与 f2 快速失败的耗时余量）：
+        // 下一次查询作为半开探测放行。
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
         AsyncMockConnection::queryFailuresRemaining = 0;
         AsyncMockConnection::queryCalls = 0;
         auto f3 = awaitResult(async::query("SELECT cb"), 3000);

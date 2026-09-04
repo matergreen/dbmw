@@ -18,6 +18,14 @@
 //     即在 io_context 线程恢复）。取消/超时/治理与回调形态完全同源。
 //   - 顶层任务用 run() 受控启动：跑完后协程帧在最终挂起点自毁，
 //     fire-and-forget 不会悬垂；不提供 detach。
+//
+// 编译器兼容性（GCC 13 已知缺陷，PR109227 系）：
+//   - co_await 表达式的实参里出现**非平凡的花括号临时**（如
+//     `co_await queryAsync(sql, {Value(1)})`）会触发 GCC 13 的
+//     internal compiler error（build_special_member_call）。
+//   - 规避：参数先具名构造再传入（`Params p{Value(1)}; co_await ...(sql, p)`）。
+//     空 `{}`、具名变量、lambda 实参不受影响（有测试覆盖）。
+//   - GCC 14+ / Clang / MSVC 无此问题。
 // ---------------------------------------------------------------------------
 
 #if !defined(DBMW_ENABLE_ASYNC_CORO)

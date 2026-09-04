@@ -607,8 +607,12 @@ cmake .. -DDBMW_ENABLE_ASYNC_CORO=ON   # only task.cpp is bumped to C++20; the r
 #include "dbmw/async/task.h"   // the including TU must be compiled as C++20
 
 dbmw::async::Task<void> demo() {
-    auto q = co_await dbmw::async::queryAsync(
-        "SELECT id FROM users WHERE age > ?", {dbmw::common::Value(std::int64_t(18))});
+    // Hoist parameters to a named local: braced temporaries inside co_await
+    // arguments trigger a GCC 13 ICE (see notes below).
+    dbmw::common::Params params;
+    params.push_back(dbmw::common::Value(std::int64_t(18)));
+
+    auto q = co_await dbmw::async::queryAsync("SELECT id FROM users WHERE age > ?", params);
     if (q.status.ok()) useRows(std::move(q.rows));
 
     auto tx = co_await dbmw::async::transactionAsync({}, [](dbmw::core::Session &s) {
@@ -627,6 +631,7 @@ Constraints and caveats:
 - Callbacks and transaction lambdas run on workers: keep them short and thread-safe. **Never call `dbmw::async::*` inside a transaction lambda** — nested async can deadlock on a small pool; use the synchronous `Session` methods directly.
 - An uncaught exception inside a top-level coroutine started by `run()` terminates the process (never silently swallowed); handle exceptions inside the coroutine or propagate them via `co_await` to an enclosing `try/catch`.
 - Do not write coroutine bodies as lambdas capturing locals — the closure temporary dies before the async operation completes and the captures dangle; use named functions returning `Task`.
+- Known GCC 13 defect: non-trivial braced temporaries directly inside `co_await` arguments (e.g. `{Value(1)}`) trigger an internal compiler error (PR109227 family); hoist parameters into a named local first. GCC 14+ / Clang / MSVC are unaffected.
 - Full design (drain order, timeout semantics, consistency test matrix): `docs/async-design-v0.2.0.md`.
 
 ## Observability

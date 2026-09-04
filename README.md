@@ -648,8 +648,11 @@ cmake .. -DDBMW_ENABLE_ASYNC_CORO=ON   # 仅 task.cpp 提标 C++20，其余 TU �
 #include "dbmw/async/task.h"   // 本 TU 必须以 C++20 编译
 
 dbmw::async::Task<void> demo() {
-    auto q = co_await dbmw::async::queryAsync(
-        "SELECT id FROM users WHERE age > ?", {dbmw::common::Value(std::int64_t(18))});
+    // 参数先具名构造：co_await 实参里的花括号临时会触发 GCC 13 ICE（见下方注意事项）
+    dbmw::common::Params params;
+    params.push_back(dbmw::common::Value(std::int64_t(18)));
+
+    auto q = co_await dbmw::async::queryAsync("SELECT id FROM users WHERE age > ?", params);
     if (q.status.ok()) useRows(std::move(q.rows));
 
     auto tx = co_await dbmw::async::transactionAsync({}, [](dbmw::core::Session &s) {
@@ -668,6 +671,7 @@ dbmw::async::run(demo());   // 受控 fire-and-forget：跑完自毁，不悬垂
 - 回调与事务 fn 跑在 worker 上，须短小、线程安全；**事务 fn 内部禁止调用 `dbmw::async::*`**（池偏小时互相等连接造成活锁），直接用同步 `Session` 方法。
 - `run()` 启动的顶层协程内未捕获异常会 `terminate`（不静默吞掉）；异常应协程内处理，或经 `co_await` 链传给有 `try/catch` 的外层。
 - 协程体不要用捕获局部引用的 lambda——闭包临时对象先于异步完成销毁，捕获会悬垂；用具名函数返回 `Task`。
+- GCC 13 已知缺陷：`co_await` 实参中直接写非平凡花括号临时（如 `{Value(1)}`）会触发编译器 ICE（PR109227 系）；参数先具名构造再传入即可规避，GCC 14+ / Clang / MSVC 不受影响。
 - 完整设计（含排水顺序、超时判定与一致性测试矩阵）见 `docs/async-design-v0.2.0.md`。
 
 ## 可观测性
