@@ -510,6 +510,7 @@ namespace dbmw::core {
             }
             impl_.reset();
         }
+        cursorLease_.reset();
     }
 
     common::Status Session::openCursor(const std::string &sql, const common::Params &params,
@@ -1373,14 +1374,15 @@ namespace dbmw::core {
         }
         // 叶子：资源护栏 + 借连接 + 打开游标 + 重试（与 queryUngated 一致，
         // 但 fetch 中途断连不重试——游标状态已丢失，交由调用方重建）。
-        if (!cursorBudgetAcquire()) {
+        std::shared_ptr<void> cursorLease;
+        if (!cursorBudgetAcquire(cursorLease)) {
             return common::Status::error(common::ErrorCode::CursorLimit,
-                                         "group '" + name_ + "': cursor limit reached");
+                                         "datasource '" + name_ + "': cursor limit reached");
         }
         common::Status status;
         const int attempts = std::max(1, retry_.max_attempts);
         for (int attempt = 1; attempt <= attempts; ++attempt) {
-            if (const auto gate = beforeAttempt(); !gate.ok()) { cursorBudgetRelease(); return gate; }
+            if (const auto gate = beforeAttempt(); !gate.ok()) return gate;
             std::unique_ptr<ConnectionPool::Handle> h;
             status = borrowSession(h, kUsePoolDefault);
             if (status.ok()) {
@@ -1389,34 +1391,35 @@ namespace dbmw::core {
                 if (status.ok() && impl) {
                     out = std::make_unique<Cursor>(std::move(h), std::move(impl),
                                                     Session::AuditContext{true, readOnly_},
-                                                    Cursor::Binding::OwnsHandle);
+                                                    Cursor::Binding::OwnsHandle,
+                                                    std::move(cursorLease));
                     return status;
                 }
                 // 打开失败：impl 为 null 或报错，借出的连接随 h 析构归还，继续重试/上报。
             }
             afterAttempt(status);
             if (status.ok()) return status; // impl 为 null 但 status.ok() 不可能，仅防御
-            if (!status.retryable || attempt == attempts) { cursorBudgetRelease(); return status; }
+            if (!status.retryable || attempt == attempts) return status;
             std::this_thread::sleep_for(retryDelay(attempt));
         }
-        cursorBudgetRelease();
         return status;
     }
 
-    // 游标资源护栏：0 表示不限制（unlimited），非 0 为剩余配额。
-    bool DataSource::cursorBudgetAcquire() const {
-        const int cap = cursorBudget_.load();
-        if (cap <= 0) return true; // 不限制
-        int cur = cap;
-        while (cur > 0) {
-            if (cursorBudget_.compare_exchange_weak(cur, cur - 1)) return true;
+    bool DataSource::cursorBudgetAcquire(std::shared_ptr<void> &lease) const {
+        lease.reset();
+        const auto state = cursorBudget_;
+        const int limit = state->limit.load();
+        if (limit <= 0) return true;
+        int open = state->open.load();
+        while (open < limit) {
+            if (state->open.compare_exchange_weak(open, open + 1)) {
+                lease = std::shared_ptr<void>(state.get(), [state](void *) {
+                    state->open.fetch_sub(1);
+                });
+                return true;
+            }
         }
         return false;
-    }
-
-    void DataSource::cursorBudgetRelease() const {
-        const int cap = cursorBudget_.load();
-        if (cap > 0) cursorBudget_.fetch_add(1); // 仅限制模式下回收配额
     }
 
     common::Status DataSource::executeBatchUngated(const std::string &sql,

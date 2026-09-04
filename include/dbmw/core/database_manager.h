@@ -258,9 +258,11 @@ namespace dbmw {
         Cursor(std::unique_ptr<ConnectionPool::Handle> h,
                std::unique_ptr<ICursor> impl,
                Session::AuditContext audit,
-               Binding binding)
+               Binding binding,
+               std::shared_ptr<void> cursorLease = {})
             : handle_(std::move(h)), impl_(std::move(impl)),
-              audit_(std::move(audit)), binding_(binding) {}
+              audit_(std::move(audit)), binding_(binding),
+              cursorLease_(std::move(cursorLease)) {}
 
         Cursor(const Cursor &) = delete;
         Cursor &operator=(const Cursor &) = delete;
@@ -294,6 +296,7 @@ namespace dbmw {
             // 独立游标显式 close 后应立即归还连接，不应等 Cursor 对象
             // 稍后析构。会话内游标没有 handle_，连接仍归 Session 所有。
             if (binding_ == Binding::OwnsHandle) handle_.reset();
+            cursorLease_.reset();
             return st;
         }
 
@@ -313,6 +316,9 @@ namespace dbmw {
         std::unique_ptr<ICursor> impl_;
         Session::AuditContext audit_;
         Binding binding_;
+        // 叶子 DataSource 的并发游标配额租约；reset/析构时由自定义 deleter
+        // 原子归还。独立共享状态保证热加载销毁 DataSource 后仍可安全关闭。
+        std::shared_ptr<void> cursorLease_;
     };
 
     // 会话回调：返回非 ok 表示失败（事务场景会触发回滚）。
@@ -439,7 +445,7 @@ namespace dbmw {
             cursorEnabled_ = cfg.enabled;
             defaultBatchSize_ = cfg.default_batch_size > 0 ? cfg.default_batch_size : 256;
             cursorScrollable_ = cfg.allow_scrollable;
-            cursorBudget_ = cfg.max_open_cursors; // 0 表示不限制
+            cursorBudget_->limit.store(cfg.max_open_cursors); // 0 表示不限制
         }
 
     private:
@@ -512,9 +518,8 @@ namespace dbmw {
                                          const CursorOptions &opts,
                                          std::unique_ptr<Cursor> &out) const;
 
-        // 游标资源护栏：0 = 不限制；非 0 = 剩余配额。
-        bool cursorBudgetAcquire() const;
-        void cursorBudgetRelease() const;
+        // 游标资源护栏：成功时 lease 持有一个配额，reset/析构即自动归还。
+        bool cursorBudgetAcquire(std::shared_ptr<void> &lease) const;
 
         // 组的写路径：按 failover 候选顺序尝试，全部不可用时走写缓冲。
         // attempt(target) 在选定候选上执行一次写；buffered 为写缓冲补发任务。
@@ -602,10 +607,14 @@ namespace dbmw {
         bool requireHealthy_ = false;
         // 写缓冲（仅 group 持有；主与候选都不可用时接管写）。
         std::shared_ptr<WriteBuffer> writeBuffer_;
-        // 游标资源护栏：剩余可开游标配额。0 表示不限制（unlimited）。
-        // 由 DatabaseManager::init 按 cursor.max_open_cursors 设置。
-        // 游标占用的是池连接数，必须限制，否则一个忘关的游标能拖垮整个池。
-        mutable std::atomic<int> cursorBudget_{0};
+        struct CursorBudgetState {
+            std::atomic<int> limit{0};
+            std::atomic<int> open{0};
+        };
+        // 上限和当前已开数必须分开保存；否则“剩余数为 0”会与“不限制”的
+        // 哨兵冲突，配额首次耗尽后后续游标反而会被放行。
+        std::shared_ptr<CursorBudgetState> cursorBudget_ =
+            std::make_shared<CursorBudgetState>();
         // 游标能力开关（由 applyCursorConfig 设置）。
         bool cursorEnabled_ = true;
         int defaultBatchSize_ = 256;        // 未显式指定 batch_size 时的兜底

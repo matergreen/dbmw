@@ -22,6 +22,8 @@ option(DBMW_ENABLE_POSTGRES "Build PostgreSQL driver (needs libpqxx + libpq)" OF
 option(DBMW_ENABLE_ODBC     "Build ODBC driver for SQL Server/Oracle"         OFF)
 option(DBMW_BUILD_EXAMPLES  "Build example programs"                          OFF)
 option(DBMW_BUILD_TESTS     "Build core behaviour tests (no external deps)"   OFF)
+option(DBMW_BUILD_INTEGRATION_TESTS
+       "Build integration tests that require live database services"          OFF)
 # 协程层（设计 §5.3）：仅 src/async/task.cpp 一个 TU 被提标到 C++20，
 # 库内其余源文件仍按 C++17 编译。宏以 PUBLIC 定义导出，下游包含
 # dbmw/async/task.h 的 TU 会拿到同一开关（且必须自行以 C++20 编译）。
