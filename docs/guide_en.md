@@ -716,6 +716,49 @@ ds->query("SELECT * FROM products ...", rs);        // lands in shadow_db (prima
 
 Validation runs in `resolveShadows` (after `init()` / `addGroup()`, before externally visible). See `tests/dbmw_shadow_test.cpp` for the full behavior matrix (39 assertions across 10 scenarios covering sync / async / cache / write-buffer / validation branches).
 
+## Read-after-write consistency, enhanced (v0.4.0 M8: session-pinned reads)
+
+`read_after_write_ms` (datasource-level timestamp window) only approximates "I probably just wrote this" — what business semantics actually want is "I just wrote this row; the very next read must return my own write." M8 layers a **session-level (ContextScope-frame-level) sticky read** on top of the timestamp window, via `SqlContext.wroteInThisRequest` (a.k.a. `wIRT`):
+
+| Priority | Condition | Route |
+|---|---|---|
+| 1 (strongest) | current SqlContext `wroteInThisRequest=true` | primary (write-then-read consistency) |
+| 2 | within `read_after_write_ms` window on DataSource | primary (timestamp fallback) |
+| 3 | replica round-robin | `replicas[]` |
+
+`wIRT` is set by `DataSource::markWrite` on the leaf write-success path, calling `pinRequestWrite()` — zero changes required on the caller side.
+
+### Usage
+
+```cpp
+{
+    common::ContextScope scope({.traceId = req.header("x-trace-id")});
+    g_->execute("UPDATE users SET name=? WHERE id=?", name, id); // markWrite → wIRT=true
+    auto rs = g_->query("SELECT name FROM users WHERE id=?", id); // auto-routed to primary
+}
+// frame destructed → wIRT gone; next read goes to replica (unless still in RAW window)
+```
+
+### Invariants
+
+- **Frame targeting**: business ContextScope is a single frame; sync `runWithInterceptors` pushes one more internal frame (a copy of view.ctx), so the top of stack is the internal frame and the business frame is `[size-2]`. `pinRequestWrite` writes to the business frame so that wIRT survives the internal frame's pop.
+- **Empty-stack early return**: when no business `ContextScope` is in scope, `pinRequestWrite()` is a no-op (the default instance is treated as const).
+- **Async isolation**: `entryCtx` is snapshotted at submit time; worker mutates `entryCtx.wroteInThisRequest=true` after a successful write; a new submit re-snapshots from the top of stack, so cross-op contamination is structurally impossible.
+- **Shadow orthogonality**: shadow writes don't enter `markWrite` on the production group, so they can't pollute production's wIRT — independent of M6.
+- **Idempotency orthogonality**: `Idempotency=NonIdempotent` forbids retry but the write still triggers `markWrite` → wIRT pins normally.
+
+### Configuration advisory
+
+Replicas + `read_after_write_ms=0` ⇒ **stale-read risk**. `ConfigLoader` emits a stderr WARN at load time but does not block:
+
+```
+dbmw WARN: datasource group 'g' has 1 replica(s) but read_after_write_ms=0;
+writes-then-reads may be served by replicas and return stale data.
+Set read_after_write_ms > 0 (e.g. 1000) to pin post-write reads to the primary.
+```
+
+Full behavior matrix in `tests/dbmw_raw_session_test.cpp` (26 assertions / 6 scenarios: sync / async / frame isolation / timestamp fallback / shadow / idempotency / ConfigLoader WARN).
+
 ## Result redaction (v0.4.0 M7: mask result sets per role / tenant)
 
 Compliance scenarios (phone, ID, bank card) require masking result-set fields per role / tenant before the data leaves dbmw. **dbmw ships no masking rules** — that would be making compliance decisions on behalf of the caller. The framework only provides the SPI hook and the I10 guard (redacted results must never enter the cache).

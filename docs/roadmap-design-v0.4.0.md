@@ -132,7 +132,7 @@
 | M5 | 幂等声明 | ✅ **已落地**（2026-09）——`context.h` 三态枚举 + 同步 `resolveWriteAttempts` + 异步 `maxAttempts` 接入 + 19 项单测。独立小改动，把重试语义从"引擎猜"变成"调用方声明" |
 | M6 | 影子库路由 | ✅ **已落地**（2026-09）——`DataSourceGroupConfig::shadow` 字段 + 同步 `readTarget/writeTargets/dispatchWrite/cacheEligible` 影子分支 + 异步 `entryCtx` 透传 + `resolveShadows` 4 项校验 + 39 项单测。复用 M1 SPI `onRoute` 触发，硬守住 I12（影子不进写缓冲）/ I10（影子不进缓存）；同步异步决策同源 |
 | M7 | 结果脱敏 | ✅ **已落地**（2026-09）——`ResultSet::transformed` 字段 + I10 守卫（cacheStore 内 `rows.transformed` 守卫 + queryUngated inline 守卫双层）+ 异步缓存命中路径补 afterExecution 修复 §9.4 风险行 + 38 项单测。完全依赖 SPI，零业务假设；改写规则由业务 MaskingInterceptor 提供 |
-| M8 | 读后写增强 | 功能已存在（§1.3），属优化项，排最后无风险 |
+| M8 | 读后写增强 | ✅ **已落地**（2026-09）——`SqlContext.wroteInThisRequest` 会话级粘性读 + `pinRequestWrite()` 在 leaf 写成功后置位栈顶 + `readTarget` 第 1 级判定 + `ConfigLoader` 副本+零窗口 WARN。3 级优先级：wIRT > 时间戳窗口 > 副本轮询；26 项单测覆盖同步 / 异步 / 帧隔离 / 影子 / 幂等正交
 
 > 原 M9「轻量分片」已随 §11 的永久排除决策移除。当前路线共 **8 项**（M1–M8）。
 
@@ -143,7 +143,7 @@
 | **A** | M1 + M2 | SPI 可注册生效；`OperationEvent` 带 traceId；同步 + 异步路径均透传 |
 | **B** | M3 + M4 + M5 | 池指标可导出；运行时增删数据源可用；幂等声明影响重试 |
 | **C** | M6 + M7 | 影子流量隔离已通过（I12 单测覆盖）；脱敏结果确认不进缓存（I10 单测覆盖，§9.4 缓存命中修复已验证）|
-| **D** | M8 | 会话级读后写生效；副本 + 零窗口的配置 WARN 生效 |
+| **D** | M8 | 会话级读后写已落地（26 项单测）；副本 + 零窗口 WARN 已生效（stderr 验证通过）|
 
 ---
 

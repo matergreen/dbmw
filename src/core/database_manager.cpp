@@ -77,6 +77,28 @@ namespace dbmw::core {
             return retry.retry_writes ? std::max(1, retry.max_attempts) : 1;
         }
 
+// M8（§10.2）：写成功后置位栈顶 SqlContext.wroteInThisRequest，
+// 让本请求后续读命中 readTarget 的"会话级读后写"分支（最强优先级）。
+// 栈空时跳过——业务未建上下文帧，default 是 const，不能也不该写。
+// 设计上**只能由 dbmw 自己置位**：业务不应在外部写出后修改它。
+//
+// 真源唯一性：markWrite 只在 leaf 写成功路径集中触发（10+ 处全集），保证
+// 写 → 读粘性不会因分散置位而漏。
+//
+// 栈帧定位：当调用栈是 [业务 ContextScope, runWithInterceptors 的 scope(copy)]
+// 两层时，栈顶是中间层（临时拷贝 view.ctx）；业务帧才是真源。pinRequestWrite
+// 必须改业务帧——否则中间 frame 弹出后 wIRT 跟着消失，下一次 read 又得新拷一份
+// view.ctx 但 wIRT 还是 false。要点：栈顶 = runWithInterceptors scope；
+// 业务帧 = size - 2。size==1 时无业务帧（直接裸调），改栈顶即可（仍会随帧
+// 析构丢弃——但裸调场景语义就是"调用结束即丢"，与 RAII 行为对齐）。
+void pinRequestWrite() {
+    auto &s = common::ContextScope::stack();
+    if (s.empty()) return;
+    const auto sz = s.size();
+    if (sz >= 2) s[sz - 2].wroteInThisRequest = true;
+    else s.back().wroteInThisRequest = true;
+}
+
         // 调用方负责：构造 ctx / 调用 runOnRoute / 构造 view / 决定 result 与
         // affected 是否对外暴露（nullptr/0 = 不暴露）。
         template <typename Fn>
@@ -853,6 +875,12 @@ namespace dbmw::core {
         // 自身 primary_ 兜底？此处严格影子语义：影子没配就当影子不成立），
         // 由 queryUngated 按叶子回退到 null 走默认逻辑。
         if (shadow_ && common::ContextScope::current().shadow) return shadow_;
+        // M8（§10.2）会话级读后写：业务在一次请求内先写后读，本请求后续的
+        // 读直接走主库。优先级**最高**——早于 read_after_write_ms 时间戳与
+        // 副本轮询，避免业务先写完后还要算时间窗口。写到置位 wIRT 由
+        // markWrite() 在 leaf 写成功路径集中处理（14 处 markWrite 真源唯一）。
+        // 线程局部栈顶（ContextScope）天然隔离：跨请求自动失效。
+        if (common::ContextScope::current().wroteInThisRequest) return primary_;
         if (readAfterWrite_ > std::chrono::milliseconds(0)) {
             const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -894,6 +922,10 @@ namespace dbmw::core {
         // 叶子节点：按名字直接拿单数据源写入时也必须失效自己的缓存，
         // 否则 execute() 之后紧接着的 query() 会在整个 TTL 内一直读到旧结果。
         QueryCache::invalidate(name_);
+        // M8（§10.2）：写成功后置位栈顶 SqlContext.wroteInThisRequest。
+        // 仅叶子触发；组的写最终也会走到叶子，由叶子写成功的 markWrite
+        // 集中处理。业务层 markWrite 不需再分别调用——保证一处真源。
+        pinRequestWrite();
     }
 
     common::Status DataSource::preGate(const std::string &sql,

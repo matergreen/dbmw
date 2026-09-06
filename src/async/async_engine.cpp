@@ -645,8 +645,15 @@ namespace dbmw::async {
                         // 记在 root 上——同步组路径同样由 dispatchWrite 记在组上。
                         // M6：影子写不走 markWrite——影子失败不该把生产组拉到
                         // read-after-write 窗口里，也不该清掉生产的查询缓存。
-                        if (ctx->policy.isWrite && !ctx->entryCtx.shadow)
+                        if (ctx->policy.isWrite && !ctx->entryCtx.shadow) {
                             ctx->root->markWrite();
+                            // M8（§10.2）：异步路径同步置位 submit 时冻结的
+                            // entryCtx——worker 跑 attemptFn 内部后续读会
+                            // 透到这一步（跨 attempt 通过 StatementOp
+                            // 共享同一份 entryCtx，不会漏）。调用线程的原
+                            // entryCtx 不被影响，符合"按请求隔离"。
+                            ctx->entryCtx.wroteInThisRequest = true;
+                        }
                         // M6：影子失败不计入 root 的熔断计数——影子库的事故不该
                         // 让生产路径被熔断短路（同步 dispatchWrite 影子短路里也
                         // 不调 afterAttempt，语义同源）。

@@ -763,6 +763,49 @@ ds->query("SELECT * FROM products ...", rs);        // 落到 shadow_db（命中
 
 校验放在 `resolveShadows`（在 `init()` 与 `addGroup()` 后、对外可见前）。详细行为与代码片段见 `tests/dbmw_shadow_test.cpp`（39 项断言，10 个场景覆盖同步 / 异步 / 缓存 / 写缓冲 / 配置校验所有分支）。
 
+## 读后写一致性增强（v0.4.0 M8：会话级粘性读）
+
+`read_after_write_ms`（数据源级时间戳窗口）只能保"近期写过的大概率命中主"——而业务语义是"我刚刚写过这个表，紧接着的 read 必须看到自己的写"。M8 在时间戳窗口之上加了一层**会话级（ContextScope 帧级）粘性**，由 `SqlContext.wroteInThisRequest`（简称 `wIRT`）承载：
+
+| 优先级 | 条件 | 路由 |
+|---|---|---|
+| 1（最强） | 当前 SqlContext `wroteInThisRequest=true` | primary（写后读一致性） |
+| 2 | DataSource `read_after_write_ms` 窗口内 | primary（时间戳兜底） |
+| 3 | 副本轮询 | replicas[] |
+
+`wIRT` 由 `DataSource::markWrite` 在 leaf 写成功路径集中触发 `pinRequestWrite()` 置位，对业务零侵入。
+
+### 用法
+
+```cpp
+{
+    common::ContextScope scope({.traceId = req.header("x-trace-id")});
+    g_->execute("UPDATE users SET name=? WHERE id=?", name, id); // markWrite → wIRT=true
+    auto rs = g_->query("SELECT name FROM users WHERE id=?", id); // 自动走 primary
+}
+// 帧析构 → wIRT 跟着销毁，下次读走副本（除非仍在 read_after_write_ms 窗口内）
+```
+
+### 不变量
+
+- **栈帧定位**：业务 ContextScope 是单帧时栈顶即业务帧；同步 `runWithInterceptors` 内部还会 push 一帧 `ContextScope`（拷贝 view.ctx），栈顶是中间层、业务帧是 `[size-2]`。`pinRequestWrite` 改业务帧，否则中间 frame 弹出后 wIRT 跟着消失。
+- **栈空早返**：业务未建 `ContextScope` 时 `pinRequestWrite()` 不写 default 实例（const-like 语义）。
+- **异步隔离**：submit 时冻结 `entryCtx`，worker 写成功后置 `entryCtx.wroteInThisRequest=true`；新 submit 重新拷快照——cross-op 不串。
+- **影子正交**：影子写不入生产组 `markWrite`，故也不会污染生产的 wIRT——与 M6（影子库路由）独立工作。
+- **幂等正交**：`Idempotency=NonIdempotent` 不重试，但写仍触发 `markWrite` → wIRT 照常置位。
+
+### 配置提醒
+
+配置副本 + `read_after_write_ms=0` = **陈旧读风险**。`ConfigLoader` 在加载时会 `fprintf(stderr, "...")` 打 WARN 提示，但不阻断 load：
+
+```
+dbmw WARN: datasource group 'g' has 1 replica(s) but read_after_write_ms=0;
+writes-then-reads may be served by replicas and return stale data.
+Set read_after_write_ms > 0 (e.g. 1000) to pin post-write reads to the primary.
+```
+
+详细行为见 `tests/dbmw_raw_session_test.cpp`（26 项断言 / 6 个场景覆盖同步 / 异步 / 帧隔离 / 时间戳兜底 / 影子 / 幂等 / config_loader WARN）。
+
 ## 结果脱敏（v0.4.0 M7：按角色 / 租户掩码结果集）
 
 合规场景（手机号、身份证、银行卡）需要在结果集返回前按角色 / 租户做掩码。**dbmw 不内置任何脱敏规则**——规则是业务 / 合规概念，内置等于替用户做合规决策；只提供 SPI 钩子和 I10 守卫（脱敏结果绝不进缓存）。

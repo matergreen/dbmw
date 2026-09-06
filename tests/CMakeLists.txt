@@ -46,12 +46,36 @@ target_link_libraries(dbmw_idempotency_test PRIVATE dbmw)
 add_executable(dbmw_shadow_test dbmw_shadow_test.cpp)
 target_link_libraries(dbmw_shadow_test PRIVATE dbmw)
 
+# M8 会话级读后写单测（§10.2）：
+#   pinRequestWrite() 在 leaf 写成功后置位 SqlContext.wroteInThisRequest；
+#   readTarget 检测到该标记后返回 primary_，早于时间戳窗口与副本轮询。
+#   通过 RAW=0 隔离掉 DataSource 时间戳窗口这条干扰线，分别验证：
+#   - 同 ContextScope 内写后读：primary（wIRT=primary）
+#   - 栈空写：pinRequestWrite 早返，不影响读
+#   - frame A 写 / frame B 读：wIRT 不串
+#   - 异步 worker entryCtx 不污染下次 submit
+#   - config_loader 副本+零窗口 → stderr WARN
+#   - M5（幂等）+ M8（wIRT）正交
+add_executable(dbmw_raw_session_test dbmw_raw_session_test.cpp)
+target_link_libraries(dbmw_raw_session_test PRIVATE dbmw)
+target_link_libraries(dbmw_raw_session_test PRIVATE Threads::Threads)
+add_test(NAME dbmw_raw_session_test COMMAND dbmw_raw_session_test)
+
 # M7 结果脱敏单测：SPI afterExecution 改写 view.result → 置位
 # rs.transformed=true → cacheStore/queryUngated 守卫硬拦截，I10 落地；
 # 缓存命中路径（同步包在 runWithInterceptors 内，异步提交时手动调）
 # 仍要走 afterExecution，否则脱敏被绕过（§9.4 风险行）。无真实数据库依赖。
 add_executable(dbmw_redaction_test dbmw_redaction_test.cpp)
 target_link_libraries(dbmw_redaction_test PRIVATE dbmw)
+
+# M8 会话级读后写单测：SqlContext.wroteInThisRequest 标记——
+# ① 同步/异步写成功后置位（DataSource::markWrite 集中真源）；
+# ② readTarget 检测到则返回 primary_（§10.2 优先级最高）；
+# ③ 异步路径通过 entryCtx 快照透传；
+# ④ config_loader 对"副本 + 零窗口"打 stderr WARN；
+# ⑤ 与 M5 幂等、M6 影子正交不冲突。无真实数据库依赖。
+add_executable(dbmw_raw_session_test dbmw_raw_session_test.cpp)
+target_link_libraries(dbmw_raw_session_test PRIVATE dbmw)
 
 # 真实数据库集成测试默认不构建，避免普通单元测试依赖外部服务；
 # 开启时由各 DBMW_TEST_* 环境变量提供连接信息，测试只操作自己的临时对象。
@@ -96,6 +120,7 @@ if(Threads_FOUND)
     target_link_libraries(dbmw_idempotency_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_shadow_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_redaction_test PRIVATE Threads::Threads)
+    target_link_libraries(dbmw_raw_session_test PRIVATE Threads::Threads)
     if(TARGET dbmw_coro_test)
         target_link_libraries(dbmw_coro_test PRIVATE Threads::Threads)
     endif()
@@ -120,3 +145,4 @@ add_test(NAME dbmw_dynamic_test COMMAND dbmw_dynamic_test)
 add_test(NAME dbmw_idempotency_test COMMAND dbmw_idempotency_test)
 add_test(NAME dbmw_shadow_test COMMAND dbmw_shadow_test)
 add_test(NAME dbmw_redaction_test COMMAND dbmw_redaction_test)
+add_test(NAME dbmw_raw_session_test COMMAND dbmw_raw_session_test)
