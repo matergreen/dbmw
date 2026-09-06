@@ -429,7 +429,9 @@ static void M8_6_idempotency_orthogonal() {
 
     common::ResultSet rs;
     {
-        common::ContextScope scope({.idempotency = common::Idempotency::NonIdempotent});
+        common::SqlContext nonIdempotentContext;
+        nonIdempotentContext.idempotency = common::Idempotency::NonIdempotent;
+        common::ContextScope scope(nonIdempotentContext);
         std::int64_t a = 0;
         check(g->execute("UPDATE x", a).ok(), "NonIdempotent write ok");
         check(a == 1, "NonIdempotent write: affected==1 (no retry w/o failure)");

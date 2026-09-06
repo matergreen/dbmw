@@ -177,7 +177,9 @@ static void test_sync_shadow_read() {
     resetCounters();
     common::ResultSet rs2;
     {
-        common::ContextScope scope({.shadow = true});
+        common::SqlContext shadowContext;
+        shadowContext.shadow = true;
+        common::ContextScope scope(shadowContext);
         check(g->query("SELECT 1", rs2).ok(), "shadow=true：query 成功");
     }
     check(MockShadowConnection::queryCount.load() == 1, "shadow=true：影子叶 query 1 次");
@@ -208,7 +210,9 @@ static void test_sync_shadow_write() {
     resetCounters();
     std::int64_t aff = 0;
     {
-        common::ContextScope scope({.shadow = true});
+        common::SqlContext shadowContext;
+        shadowContext.shadow = true;
+        common::ContextScope scope(shadowContext);
         check(g->execute("INSERT INTO t VALUES (1)", aff).ok(),
               "shadow=true：execute 成功");
     }
@@ -296,7 +300,9 @@ static void test_shadow_no_write_buffer() {
     std::int64_t aff = 0;
     common::Status st;
     {
-        common::ContextScope scope({.shadow = true});
+        common::SqlContext shadowContext;
+        shadowContext.shadow = true;
+        common::ContextScope scope(shadowContext);
         st = g->execute("INSERT INTO t VALUES (1)", aff);
     }
     check(!st.ok(), "影子写失败：返回失败");
@@ -338,7 +344,9 @@ static void test_shadow_no_cache() {
     {
         // 第一次：影子触发——cacheLookup 内部短路，不应命中任何缓存（短路返回 false）。
         // 影子叶被实际调用一次。
-        common::ContextScope scope({.shadow = true});
+        common::SqlContext shadowContext;
+        shadowContext.shadow = true;
+        common::ContextScope scope(shadowContext);
         check(g->query("SELECT 'cached'", rs1).ok(), "首次（影子）：成功");
     }
     {
@@ -480,7 +488,9 @@ static void test_async_shadow_write() {
 
     std::promise<async::ExecResult> pr;
     auto fut = pr.get_future();
-    common::ContextScope scope({.shadow = true});
+    common::SqlContext shadowContext;
+    shadowContext.shadow = true;
+    common::ContextScope scope(shadowContext);
     async::execute("grp", "INSERT INTO t VALUES (1)",
                    [&](async::ExecResult &&r) { pr.set_value(std::move(r)); });
     const auto out = fut.get();
@@ -523,7 +533,9 @@ static void test_async_shadow_query() {
 
     std::promise<async::QueryResult> pr;
     auto fut = pr.get_future();
-    common::ContextScope scope({.shadow = true});
+    common::SqlContext shadowContext;
+    shadowContext.shadow = true;
+    common::ContextScope scope(shadowContext);
     async::query("grp", "SELECT 1",
                  [&](async::QueryResult &&r) { pr.set_value(std::move(r)); });
     const auto out = fut.get();

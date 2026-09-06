@@ -203,7 +203,9 @@ int main() {
         mgr.addDataSource(mockLeafCfg("ds"), retryOpts(/*retryWrites=*/true, /*max=*/3));
         auto ds = mgr.getDataSource("ds");
         resetMock(/*execFails=*/5);
-        common::ContextScope scope({.idempotency = common::Idempotency::NonIdempotent});
+        common::SqlContext context;
+        context.idempotency = common::Idempotency::NonIdempotent;
+        common::ContextScope scope(context);
         std::int64_t aff = 0;
         const auto st = ds->execute("INSERT INTO t VALUES (1)", aff);
         check(!st.ok(), "NonIdempotent：失败（未重试）");
@@ -219,7 +221,9 @@ int main() {
         mgr.addDataSource(mockLeafCfg("ds"), retryOpts(/*retryWrites=*/false, /*max=*/3));
         auto ds = mgr.getDataSource("ds");
         resetMock(/*execFails=*/2);
-        common::ContextScope scope({.idempotency = common::Idempotency::Idempotent});
+        common::SqlContext context;
+        context.idempotency = common::Idempotency::Idempotent;
+        common::ContextScope scope(context);
         std::int64_t aff = 0;
         const auto st = ds->execute("INSERT INTO t VALUES (1)", aff);
         check(st.ok(), "Idempotent + retry_writes=false：重试后成功");
@@ -235,7 +239,9 @@ int main() {
         mgr.addDataSource(mockLeafCfg("ds"), retryOpts(/*retryWrites=*/false, /*max=*/3));
         auto ds = mgr.getDataSource("ds");
         resetMock(/*execFails=*/5);
-        common::ContextScope scope({.idempotency = common::Idempotency::Idempotent});
+        common::SqlContext context;
+        context.idempotency = common::Idempotency::Idempotent;
+        common::ContextScope scope(context);
         std::int64_t aff = 0;
         const auto st = ds->execute("INSERT INTO t VALUES (1)", aff);
         check(!st.ok(), "Idempotent：失败耗尽");
@@ -251,7 +257,9 @@ int main() {
         mgr.addDataSource(mockLeafCfg("ds"), retryOpts(/*retryWrites=*/true, /*max=*/3));
         auto ds = mgr.getDataSource("ds");
         resetMock(/*execFails=*/5);
-        common::ContextScope scope({.idempotency = common::Idempotency::NonIdempotent});
+        common::SqlContext context;
+        context.idempotency = common::Idempotency::NonIdempotent;
+        common::ContextScope scope(context);
         std::int64_t aff = 0;
         const auto st = ds->execute("INSERT INTO t VALUES (1)", aff);
         check(!st.ok(), "NonIdempotent + 可重试错误：失败（不重试）");
@@ -302,7 +310,9 @@ int main() {
         {
             std::promise<async::ExecResult> pr;
             auto fut = pr.get_future();
-            common::ContextScope scope({.idempotency = common::Idempotency::Idempotent});
+            common::SqlContext context;
+            context.idempotency = common::Idempotency::Idempotent;
+            common::ContextScope scope(context);
             async::execute("main", "INSERT INTO t VALUES (1)",
                            [&](async::ExecResult &&r) { pr.set_value(std::move(r)); });
             const auto out = fut.get();
@@ -316,7 +326,9 @@ int main() {
         {
             std::promise<async::ExecResult> pr;
             auto fut = pr.get_future();
-            common::ContextScope scope({.idempotency = common::Idempotency::NonIdempotent});
+            common::SqlContext context;
+            context.idempotency = common::Idempotency::NonIdempotent;
+            common::ContextScope scope(context);
             async::execute("main", "INSERT INTO t VALUES (1)",
                            [&](async::ExecResult &&r) { pr.set_value(std::move(r)); });
             const auto out = fut.get();

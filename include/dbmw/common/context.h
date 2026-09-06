@@ -65,7 +65,8 @@ namespace dbmw::common {
     // 不会出现"上下文泄漏到下一个请求"。
     //
     // 用法：业务在请求入口构造一次；中间件任意深度都能读到
-    //   common::ContextScope scope({.traceId = "...", .tenantId = "..."});
+    //   common::SqlContext ctx; ctx.traceId = "..."; ctx.tenantId = "...";
+    //   common::ContextScope scope(ctx);
     //   DBMW::query(...);   // 内部任意层都能拿 current()
     //
     // 栈深上限（kMaxDepth）防御拦截器内部再发 SQL 时的无限递归。超限后构造
