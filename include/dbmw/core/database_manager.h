@@ -644,6 +644,11 @@ namespace dbmw {
         std::vector<std::shared_ptr<DataSource>> failoverPrimaries_;
         // 故障转移是否要求候选连接池健康（true 时跳过 pool 已销毁的候选）。
         bool requireHealthy_ = false;
+        // M6 影子库：声明的影子数据源名（来自 DataSourceGroupConfig::shadow）；
+        // 由 DatabaseManager::resolveShadows 在所有数据源构建完成后解析为
+        // 强引用存入 shadow_。空 = 未配置影子库（路由层短路不切影子）。
+        std::string shadowName_;
+        std::shared_ptr<DataSource> shadow_;
         // 写缓冲（仅 group 持有；主与候选都不可用时接管写）。
         std::shared_ptr<WriteBuffer> writeBuffer_;
         struct CursorBudgetState {
@@ -780,6 +785,15 @@ namespace dbmw {
             const std::unordered_set<std::string> &replicaNames,
             std::vector<std::shared_ptr<WriteBuffer> > &outBuffers,
             std::shared_ptr<DataSource> &outSource);
+
+        // M6 影子库解析：把每组的 shadowName_ 转为 DataSource 强引用。
+        //
+        // 必须在所有 datasources_/groups_ 构建完成后调用一次（init / addGroup
+        // 各自在末尾触发），校验：① 影子源必须存在；② 影子源不能是该组的成员
+        // （否则等于自己影自己——影子读到的"主"就是源组本身，无意义且易误导）；
+        // ③ 影子源不能是任何组名（组不可直接作影子路由目标）。
+        // 任一失败返回 ConfigError，整体回滚由调用方负责（addGroup 路径直接拒绝）。
+        [[nodiscard]] common::Status resolveShadows();
 
         mutable std::mutex mtx_;
         std::unordered_map<std::string, std::shared_ptr<ConnectionPool> > pools_;

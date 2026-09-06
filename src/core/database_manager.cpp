@@ -91,6 +91,13 @@ namespace dbmw::core {
             }
             auto guard = detail::makeInterceptorGuard(view);
             const auto t0 = std::chrono::steady_clock::now();
+            // M6（§8.3 + §3.5）：把 onRoute 决策（含 shadow / targetDataSource）
+            // 压入线程栈顶，让 readTarget / writeTargets / dispatchWrite / cacheLookup
+            // 在路由期能读到。这是和 M5 同源的设计——M5 的 idempotency 由调用方
+            // 显式 push ContextScope 透传；M6 的 shadow 由 onRoute 写入 routeCtx，
+            // 由本层把 routeCtx 装上栈，使两条注入路径都通过 ContextScope::current()
+            // 呈现给下游。RAII 还原栈帧，异常路径同样安全。
+            const common::ContextScope scope(view.ctx);
             auto st = std::forward<Fn>(fn)();
             view.duration = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t0);
@@ -841,6 +848,11 @@ namespace dbmw::core {
     // -----------------------------------------------------------------------
     std::shared_ptr<DataSource> DataSource::readTarget() const {
         if (!primary_) return nullptr;
+        // M6 影子库（§8）：onRoute 置位 ctx.shadow = true 后，路由层把整组读
+        // 流量切换到影子数据源。影子不存在直接短路返回 nullptr（叶子级会走到
+        // 自身 primary_ 兜底？此处严格影子语义：影子没配就当影子不成立），
+        // 由 queryUngated 按叶子回退到 null 走默认逻辑。
+        if (shadow_ && common::ContextScope::current().shadow) return shadow_;
         if (readAfterWrite_ > std::chrono::milliseconds(0)) {
             const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -924,6 +936,12 @@ namespace dbmw::core {
     std::vector<std::shared_ptr<DataSource>> DataSource::writeTargets() const {
         std::vector<std::shared_ptr<DataSource>> targets;
         if (!primary_) return targets; // 叶子节点：调用方直接走自身
+        // M6 影子库（§8 + I12）：影子写**绝不**走故障转移或写缓冲——影子库
+        // 不可用就应该让压测停掉，而不是悄悄降级到主库污染生产数据。
+        if (shadow_ && common::ContextScope::current().shadow) {
+            targets.push_back(shadow_);
+            return targets;
+        }
         if (failoverPrimaries_.empty()) {
             // 未配置故障转移：保持原语义，写只打主库。
             targets.push_back(primary_);
@@ -959,6 +977,16 @@ namespace dbmw::core {
     common::Status DataSource::dispatchWrite(
         const std::function<common::Status(const std::shared_ptr<DataSource> &)> &attempt,
         const std::function<common::Status()> &buffered) const {
+        // M6 影子短路（§8.3 + I12）：writeTargets() 在影子模式下已经返回单元素
+        // {shadow_}。这里在尝试之前直接拦一次，明确"影子写不入写缓冲"的语义——
+        // 哪怕 shadow_ 失败，也只把错误回给调用方，不让压测数据补发回生产库。
+        if (shadow_ && common::ContextScope::current().shadow) {
+            const auto st = attempt(shadow_);
+            // 影子写不走 markWrite：写缓冲都不会更新，更不该让读后写窗口切主。
+            // 也不走 afterAttempt 触发的熔断计数——影子失败是影子库自己的事，
+            // 不该让熔断去屏蔽生产路径。
+            return st;
+        }
         const auto targets = writeTargets();
 
         // 一个候选都没有时的默认结论：整组不可写。标成可重试，让上层的
@@ -1096,11 +1124,16 @@ namespace dbmw::core {
     bool DataSource::cacheLookup(const std::string &sql, const common::Params &params,
                                  common::ResultSet &out, std::string &key) const {
         if (!cacheEligible()) return false;
+        // M6（§8.3）：影子读**绝不**进查询缓存——影子命中会污染真实租户的缓存，
+        // 下一次非影子请求可能直接拿到影子库里的数据。最保守的拦截放在这里。
+        if (common::ContextScope::current().shadow) return false;
         key = cacheKey(sql, params);
         return QueryCache::get(name_, key, out);
     }
 
     void DataSource::cacheStore(const std::string &key, const common::ResultSet &rows) const {
+        // M6（§8.3）：与 cacheLookup 同源。
+        if (common::ContextScope::current().shadow) return;
         if (!primary_ && QueryCache::enabled()) QueryCache::put(name_, key, rows);
     }
 
@@ -1108,7 +1141,7 @@ namespace dbmw::core {
     {
         if (const auto g = preGate(sql, common::OperationType::Query); !g.ok()) return g;
         // M1 SPI 埋点：顶层入口（I9），不在 queryUngated 中重复。
-        common::SqlContext ctx;
+        common::SqlContext ctx = common::ContextScope::current();
         detail::runOnRoute(name_, sql, common::OperationType::Query, ctx);
         ExecutionView view{name_, sql, common::OperationType::Query,
                            /*params*/ nullptr, /*result*/ &out,
@@ -1137,8 +1170,10 @@ namespace dbmw::core {
         // 同一条 SQL 打到主和打到副本是两条独立缓存项，写后失效才能按节点精确清除。
         // cache_on_replica_only 打开时只缓存副本读——读主库通常正是为了读到
         // 刚写进去的数据，给它加缓存等于把强一致读悄悄降级成最终一致。
+        // M6（§8.3）：影子读不进查询缓存——会污染真实租户的缓存。
         const bool caching = QueryCache::enabled() &&
-            (!QueryCache::replicaOnly() || readReplica_);
+            (!QueryCache::replicaOnly() || readReplica_) &&
+            !common::ContextScope::current().shadow;
         std::string key;
         if (caching) {
             key = cacheKey(sql, common::Params{});
@@ -1171,7 +1206,7 @@ namespace dbmw::core {
     {
         if (const auto g = preGate(sql, common::OperationType::Query); !g.ok()) return g;
         // M1 SPI 埋点：顶层入口（I9），不在 queryUngated 中重复。
-        common::SqlContext ctx;
+        common::SqlContext ctx = common::ContextScope::current();
         detail::runOnRoute(name_, sql, common::OperationType::Query, ctx);
         ExecutionView view{name_, sql, common::OperationType::Query,
                            &params, &out, 0, std::chrono::microseconds{0},
@@ -1196,7 +1231,8 @@ namespace dbmw::core {
             return status;
         }
         const bool caching = QueryCache::enabled() &&
-            (!QueryCache::replicaOnly() || readReplica_);
+            (!QueryCache::replicaOnly() || readReplica_) &&
+            !common::ContextScope::current().shadow;
         std::string key;
         if (caching) {
             key = cacheKey(sql, params);
@@ -1228,7 +1264,7 @@ namespace dbmw::core {
     {
         if (const auto g = preGate(sql, common::OperationType::Execute); !g.ok()) return g;
         // M1 SPI 埋点：顶层入口（I9）。
-        common::SqlContext ctx;
+        common::SqlContext ctx = common::ContextScope::current();
         detail::runOnRoute(name_, sql, common::OperationType::Execute, ctx);
         ExecutionView view{name_, sql, common::OperationType::Execute,
                            nullptr, nullptr, 0, std::chrono::microseconds{0},
@@ -1287,7 +1323,7 @@ namespace dbmw::core {
     {
         if (const auto g = preGate(sql, common::OperationType::Execute); !g.ok()) return g;
         // M1 SPI 埋点：顶层入口（I9）。
-        common::SqlContext ctx;
+        common::SqlContext ctx = common::ContextScope::current();
         detail::runOnRoute(name_, sql, common::OperationType::Execute, ctx);
         ExecutionView view{name_, sql, common::OperationType::Execute,
                            &params, nullptr, 0, std::chrono::microseconds{0},
@@ -1356,7 +1392,7 @@ namespace dbmw::core {
                                        common::GeneratedKeys &out) const {
         if (const auto g = preGate(sql, common::OperationType::Execute); !g.ok()) return g;
         // M1 SPI 埋点：顶层入口（I9）。
-        common::SqlContext ctx;
+        common::SqlContext ctx = common::ContextScope::current();
         detail::runOnRoute(name_, sql, common::OperationType::Execute, ctx);
         ExecutionView view{name_, sql, common::OperationType::Execute,
                            nullptr, nullptr, 0, std::chrono::microseconds{0},
@@ -1405,7 +1441,7 @@ namespace dbmw::core {
                                        common::GeneratedKeys &out) const {
         if (const auto g = preGate(sql, common::OperationType::Execute); !g.ok()) return g;
         // M1 SPI 埋点：顶层入口（I9）。
-        common::SqlContext ctx;
+        common::SqlContext ctx = common::ContextScope::current();
         detail::runOnRoute(name_, sql, common::OperationType::Execute, ctx);
         ExecutionView view{name_, sql, common::OperationType::Execute,
                            &params, nullptr, 0, std::chrono::microseconds{0},
@@ -1472,7 +1508,7 @@ namespace dbmw::core {
                                      common::ResultSet &out) const {
         if (const auto g = preGate(sql, common::OperationType::Query); !g.ok()) return g;
         // M1 SPI 埋点：顶层入口（I9）。流式参数不进 ExecutionView.params。
-        common::SqlContext ctx;
+        common::SqlContext ctx = common::ContextScope::current();
         detail::runOnRoute(name_, sql, common::OperationType::Query, ctx);
         ExecutionView view{name_, sql, common::OperationType::Query,
                            nullptr, &out, 0, std::chrono::microseconds{0},
@@ -1512,7 +1548,7 @@ namespace dbmw::core {
                                        common::GeneratedKeys &out) const {
         if (const auto g = preGate(sql, common::OperationType::Execute); !g.ok()) return g;
         // M1 SPI 埋点：顶层入口（I9）。流式参数不进 ExecutionView.params。
-        common::SqlContext ctx;
+        common::SqlContext ctx = common::ContextScope::current();
         detail::runOnRoute(name_, sql, common::OperationType::Execute, ctx);
         ExecutionView view{name_, sql, common::OperationType::Execute,
                            nullptr, nullptr, 0, std::chrono::microseconds{0},
@@ -1555,7 +1591,7 @@ namespace dbmw::core {
         if (const auto g = preGate(sql, common::OperationType::Batch); !g.ok()) return g;
         // M1 SPI 埋点：顶层入口（I9）。批次结果（每行 affected）不进 view，
         // BatchResult 含 vector，写入 view.result 会让接口误把它当 ResultSet 处理。
-        common::SqlContext ctx;
+        common::SqlContext ctx = common::ContextScope::current();
         detail::runOnRoute(name_, sql, common::OperationType::Batch, ctx);
         ExecutionView view{name_, sql, common::OperationType::Batch,
                            nullptr, nullptr, 0, std::chrono::microseconds{0},
@@ -1594,7 +1630,7 @@ namespace dbmw::core {
                                          std::uint64_t &rows) const {
         if (const auto g = preGate(sql, common::OperationType::Stream); !g.ok()) return g;
         // M1 SPI 埋点：顶层入口（I9）。流式无 ResultSet，view.result=nullptr。
-        common::SqlContext ctx;
+        common::SqlContext ctx = common::ContextScope::current();
         detail::runOnRoute(name_, sql, common::OperationType::Stream, ctx);
         ExecutionView view{name_, sql, common::OperationType::Stream,
                            &params, nullptr, 0, std::chrono::microseconds{0},
@@ -1636,7 +1672,7 @@ namespace dbmw::core {
                                             common::BatchResult &out) const {
         if (const auto g = preGate(sql, common::OperationType::Batch); !g.ok()) return g;
         // M1 SPI 埋点：顶层入口（I9）。批次结果不进 view（见 StreamParamBatch 版注释）。
-        common::SqlContext ctx;
+        common::SqlContext ctx = common::ContextScope::current();
         detail::runOnRoute(name_, sql, common::OperationType::Batch, ctx);
         ExecutionView view{name_, sql, common::OperationType::Batch,
                            nullptr, nullptr, 0, std::chrono::microseconds{0},
@@ -1668,7 +1704,7 @@ namespace dbmw::core {
         if (const auto g = preGate(sql, common::OperationType::Select); !g.ok()) return g;
         // M1 SPI 埋点：顶层入口（I9）。游标无 ResultSet，view.result=nullptr；
         // affected 非游标语义，亦不暴露。
-        common::SqlContext ctx;
+        common::SqlContext ctx = common::ContextScope::current();
         detail::runOnRoute(name_, sql, common::OperationType::Select, ctx);
         ExecutionView view{name_, sql, common::OperationType::Select,
                            &params, nullptr, 0, std::chrono::microseconds{0},
@@ -2185,6 +2221,31 @@ namespace dbmw::core {
             defaultName_ = cfg.default_datasource;
         }
 
+        // M6：把每组的 shadowName_ 解析为强引用——必须在新 datasources_ 已落
+        // 锁之后、观察者/对外 API 之前。校验失败直接回滚（把旧池/旧心跳装回
+        // datasources_/pools_/writeBuffers_/heartbeat_），保留 init 之前的
+        // 运行态，避免一个配置错误把工作进程变成"无数据源"状态。
+        if (const auto rs = resolveShadows(); !rs.ok()) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            // 暂存新（失败）态，让它析构；旧态先 move 回原位再清空暂存。
+            auto stalePools = std::move(pools_);
+            auto staleSources = std::move(datasources_);
+            auto staleBuffers = std::move(writeBuffers_);
+            auto staleHeartbeat = std::move(heartbeat_);
+            pools_ = std::move(oldPools);
+            datasources_ = std::move(oldSources);
+            writeBuffers_ = std::move(oldWriteBuffers);
+            heartbeat_ = std::move(oldHeartbeat);
+            // 清空临时名（init 之前可能为空）。
+            stalePools.clear();
+            staleSources.clear();
+            staleBuffers.clear();
+            staleHeartbeat.reset();
+            (void) stalePools; (void) staleSources;
+            (void) staleBuffers; (void) staleHeartbeat;
+            return rs;
+        }
+
         common::Observability::configure(cfg.observability);
         // M3 池指标推送通道：把采集能力注入到 Observability，让外部观察者
         // （Prometheus exporter 等）按周期或按需拿到全量数据源快照。
@@ -2403,6 +2464,9 @@ namespace dbmw::core {
             group.failover.require_healthy,
             writeBuffer);
         outSource->applyCursorConfig(opts.cursor);
+        // M6：影子名延迟到 resolveShadows 解析——那时 datasources_ 已全量就位，
+        // 引用完整性（影子源必须存在、非本组成员、非任何组名）才能成立。
+        outSource->shadowName_ = group.shadow;
         DBMW_LOG_INFO("datasource group registered: " + group.name
                       + " primary=" + group.primary
                       + (group.read_only ? " (read-only)" : "")
@@ -2410,7 +2474,66 @@ namespace dbmw::core {
                              ? ""
                              : " failover=" + std::to_string(
                                    group.failover.primaries.size()) + " candidate(s)")
-                      + (writeBuffer ? " write-buffer=on" : ""));
+                      + (writeBuffer ? " write-buffer=on" : "")
+                      + (group.shadow.empty() ? "" : " shadow=" + group.shadow));
+        return common::Status::OK();
+    }
+
+    // -------------------------------------------------------------------
+    // M6 影子库解析（§8.4）。
+    //
+    // 校验规则（任一失败返回 ConfigError）：
+    //   1. 影子源必须存在于 datasources_ 映射；
+    //   2. 影子源不得是任何组名（组不可直接作影子目标——路由只接受叶子）；
+    //   3. 影子源不得是该组的成员（自己影自己无意义，且会让影子库的读命中
+    //      到源组的副本/主，完全偏离压测目的）。
+    //
+    // 校验通过则把 shadow_ 填为强引用。路由层 readTarget/writeTargets 在
+    // ContextScope::current().shadow 为真且 shadow_ 非空时直接返回。
+    // -------------------------------------------------------------------
+    common::Status DatabaseManager::resolveShadows() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        // 收集所有组名（影子源不得是组名）。
+        std::unordered_set<std::string> groupNames;
+        for (const auto &kv : datasources_) {
+            if (kv.second && kv.second->primary_) groupNames.insert(kv.first);
+        }
+        for (const auto &kv : datasources_) {
+            const auto &ds = kv.second;
+            if (!ds || ds->shadowName_.empty()) continue;
+            const auto &name = ds->shadowName_;
+            // ① 影子源必须存在。
+            const auto it = datasources_.find(name);
+            if (it == datasources_.end() || !it->second) {
+                return common::Status::error(
+                    common::ErrorCode::ConfigError,
+                    "group '" + ds->name_ + "' references unknown shadow '"
+                    + name + "'");
+            }
+            // ② 影子源不得是任何组名。
+            if (groupNames.find(name) != groupNames.end()) {
+                return common::Status::error(
+                    common::ErrorCode::ConfigError,
+                    "group '" + ds->name_ + "' shadow '" + name
+                    + "' is a group; shadow target must be a plain datasource");
+            }
+            // ③ 影子源不得是该组的成员（主/副本）。
+            if (it->second == ds->primary_) {
+                return common::Status::error(
+                    common::ErrorCode::ConfigError,
+                    "group '" + ds->name_ + "' shadow '" + name
+                    + "' is the group's primary; self-shadowing is rejected");
+            }
+            for (const auto &replica : ds->replicas_) {
+                if (replica && replica == it->second) {
+                    return common::Status::error(
+                        common::ErrorCode::ConfigError,
+                        "group '" + ds->name_ + "' shadow '" + name
+                        + "' is a replica of the group; self-shadowing is rejected");
+                }
+            }
+            ds->shadow_ = it->second;
+        }
         return common::Status::OK();
     }
 
@@ -2605,6 +2728,19 @@ namespace dbmw::core {
                 return common::Status::error(common::ErrorCode::Unknown,
                                              "write buffer start failed");
             }
+        }
+        // M6：解析本次新组的影子引用。失败回滚——剔出新加的 datasources_ 与
+        // 缓冲（缓冲线程已起，先 stop 再移除），保证 addGroup 整体失败语义。
+        if (const auto rs = resolveShadows(); !rs.ok()) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            datasources_.erase(cfg.name);
+            for (auto &buffer: stagedBuffers) {
+                if (buffer) buffer->stop();
+                writeBuffers_.erase(std::remove(writeBuffers_.begin(),
+                                                writeBuffers_.end(), buffer),
+                                   writeBuffers_.end());
+            }
+            return rs;
         }
         return common::Status::OK();
     }

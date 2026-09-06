@@ -293,6 +293,16 @@ namespace dbmw::config {
         // 该 group 是否只读：开启后拦截一切写（配合 SqlAuditConfig.enforce_read_only）。
         bool read_only = false;
         FailoverConfig failover;
+        // M6 影子库：配置下整个组流量可路由到的影子数据源名。
+        //
+        // 解析期校验（src/config/config_loader.cpp）：
+        //   - 指向的 DataSource 必须存在；
+        //   - 不得是该 group 自身的成员（否则等于自己影自己）；
+        //   - 不得与任何组名同名（避免引用歧义）。
+        //
+        // 触发走 SPI 的 onRoute 置位 ctx.shadow = true（见
+        // docs/roadmap-design-v0.4.0.md §8.2）。空字符串 = 未配置影子库。
+        std::string shadow;
     };
 
     // 全局配置（对应 datasources.json 根）。

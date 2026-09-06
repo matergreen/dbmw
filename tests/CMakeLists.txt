@@ -40,6 +40,12 @@ target_link_libraries(dbmw_dynamic_test PRIVATE dbmw)
 add_executable(dbmw_idempotency_test dbmw_idempotency_test.cpp)
 target_link_libraries(dbmw_idempotency_test PRIVATE dbmw)
 
+# M6 影子库路由单测：onRoute 置位 ctx.shadow=true 后，路由层把读/写打
+# 到影子数据源；影子写不进写缓冲（I12）、影子读不进查询缓存；配置校验
+# 拒绝（影子源不存在/是本组主/是本组副本/是另一个组名）。无真实数据库依赖。
+add_executable(dbmw_shadow_test dbmw_shadow_test.cpp)
+target_link_libraries(dbmw_shadow_test PRIVATE dbmw)
+
 # 真实数据库集成测试默认不构建，避免普通单元测试依赖外部服务；
 # 开启时由各 DBMW_TEST_* 环境变量提供连接信息，测试只操作自己的临时对象。
 if(DBMW_BUILD_INTEGRATION_TESTS AND DBMW_ENABLE_POSTGRES)
@@ -81,6 +87,7 @@ if(Threads_FOUND)
     target_link_libraries(dbmw_exporters_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_dynamic_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_idempotency_test PRIVATE Threads::Threads)
+    target_link_libraries(dbmw_shadow_test PRIVATE Threads::Threads)
     if(TARGET dbmw_coro_test)
         target_link_libraries(dbmw_coro_test PRIVATE Threads::Threads)
     endif()
@@ -103,3 +110,4 @@ add_test(NAME dbmw_observability_test COMMAND dbmw_observability_test)
 add_test(NAME dbmw_exporters_test COMMAND dbmw_exporters_test)
 add_test(NAME dbmw_dynamic_test COMMAND dbmw_dynamic_test)
 add_test(NAME dbmw_idempotency_test COMMAND dbmw_idempotency_test)
+add_test(NAME dbmw_shadow_test COMMAND dbmw_shadow_test)

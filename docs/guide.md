@@ -701,6 +701,68 @@ dbmw::DBMW::removeDataSource("legacy_leaf");           // 再卸叶子
 
 异步路径同源：`async::execute` 的 `maxAttempts` 读取 submit 时刻栈顶 `ContextScope` 的快照（`entryCtx.idempotency`），与同步 `resolveWriteAttempts` 用同一张优先级表。详细行为见 `tests/dbmw_idempotency_test.cpp`（19 项断言，9 个场景覆盖三态 × 同步/异步 × 读路径不受影响）。
 
+## 影子库路由（v0.4.0 M6：把整组流量切到影子数据源）
+
+生产流量回放做全链路压测：把读 / 写流量引到影子库，验证新版本在真实负载下的表现而不污染生产数据。影子库路由由 **M1 SPI 的 `onRoute`** 决策（按 `tenantId`、灰度比例、HTTP 头……都可），落到路由层只是一行 `ctx.shadow = true`。
+
+**配置**：在组上声明影子目标——它必须是一个**普通叶子数据源**，不能是本组成员、不能是另一个组（避免引用歧义）：
+
+```json
+{
+  "datasources": [
+    { "name": "prod",      "type": "mysql",  "host": "primary.db" },
+    { "name": "prod_repl", "type": "mysql",  "host": "replica.db" },
+    { "name": "shadow_db", "type": "mysql",  "host": "shadow.db" }
+  ],
+  "groups": [{
+    "name": "order_svc",
+    "primary": "prod",
+    "replicas": [{ "name": "prod_repl", "weight": 1 }],
+    "shadow": "shadow_db"
+  }]
+}
+```
+
+**触发**：通过 SPI（最常用——按租户 / 灰度比例灵活切换）：
+
+```cpp
+dbmw::DBMW::addInterceptor({
+    .onRoute = [](const std::string&, const std::string&,
+                  dbmw::common::OperationType,
+                  dbmw::common::SqlContext &ctx) {
+        // 例：每 1% 流量切到影子
+        if (shouldReplayToShadow(ctx.tenantId)) ctx.shadow = true;
+    }
+});
+```
+
+或者直接用线程本地 `ContextScope`（同一线程 / 协程全程生效）：
+
+```cpp
+dbmw::common::ContextScope scope({.shadow = true});
+ds->execute("INSERT INTO orders ...", affected);   // 落到 shadow_db
+ds->query("SELECT * FROM products ...", rs);        // 落到 shadow_db（命中主/副本按 routing）
+```
+
+**影子模式的核心不变量**：
+
+| 行为 | 规则 | 原因 |
+| --- | --- | --- |
+| 影子读 / 写路由 | `readTarget()` / `writeTargets()` 在 `ctx.shadow` 为真时返回 `shadow_` | 整组流量统一切走 |
+| **影子写不进写缓冲**（I12） | `dispatchWrite` 影子短路：尝试影子，失败直接返回错误，不构造 buffered lambda | 缓冲补发会把压测数据写回生产库——数据污染事故 |
+| **影子读不进查询缓存**（I10） | `cacheEligible()` 在 `ctx.shadow` 为真时返回 `false` | 避免把压测结果混入生产租户的缓存 |
+| 影子故障 | 短路返回错误，**不**追加主回退候选 | 影子不可用就让压测停掉，不悄悄降级污染生产 |
+| 异步路径 | `entryCtx` 在 submit 时刻快照 `routeCtx`，worker 与 I12 / I10 守卫读到的 `ctx.shadow` 一致 | 跨路径语义同源 |
+
+**配置校验**（`addGroup` 阶段必查，任一不合法返回 `ConfigError`）：
+
+- 影子源必须存在（已 `addDataSource`）；
+- 影子源**不得**是本组主（自影自己）；
+- 影子源**不得**是本组副本；
+- 影子源**不得**与任何组名同名（避免引用歧义）。
+
+校验放在 `resolveShadows`（在 `init()` 与 `addGroup()` 后、对外可见前）。详细行为与代码片段见 `tests/dbmw_shadow_test.cpp`（39 项断言，10 个场景覆盖同步 / 异步 / 缓存 / 写缓冲 / 配置校验所有分支）。
+
 ## 异步 API（v0.2.0：回调 / future / 协程）
 
 三种调用形态共享同一条执行管线——治理闸门（审计/限流/熔断/缓存）、重试退避、语句超时、取消——只是结果交付方式不同。在配置中开启 `async`：

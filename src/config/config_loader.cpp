@@ -521,6 +521,17 @@ namespace dbmw::config {
                         return false;
                     }
                 }
+                // M6 影子库（§8）：解析 shadow 字段。
+                // 仅做类型与基本形状校验；引用完整性（必须存在、非本组成员、
+                // 非任何组名）在 DatabaseManager::resolveShadows 统一验证——
+                // 那时 datasources_/groups_ 已经构建完成。
+                if (g.contains("shadow") && !g["shadow"].is_string()) {
+                    error = "group '" + group.name + "' shadow must be a string";
+                    return false;
+                }
+                if (g.contains("shadow")) {
+                    group.shadow = g["shadow"].get<std::string>();
+                }
                 out.groups.push_back(std::move(group));
             }
         }

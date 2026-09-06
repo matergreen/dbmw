@@ -1,6 +1,7 @@
 #include "dbmw/async/dbmw_async.h"
 #include "dbmw/common/context.h"
 #include "dbmw/common/logger.h"
+#include "dbmw/core/interceptor.h"
 #include "dbmw/dbmw.h"
 
 #include <algorithm>
@@ -410,19 +411,31 @@ namespace dbmw::async {
                                           "datasource '" + root->name() + "' circuit is open"));
                 }
 
-                // 路由（纯内存，无 IO）：
+                // M6（§8.2 + §8.3）：异步路径下路由决策也在调用线程做——
+                // 调用 onRoute 拿到带 shadow/targetDataSource 的 routeCtx，
+                // 围绕后续 readTarget/writeTargets 计算压栈，让路由层读到。
+                // routeCtx 同时作为 entryCtx 喂给 worker（attemptFn 内的 Session
+                // 子语句与 I12 写缓冲守卫都靠它识别影子流量）。
+                common::SqlContext routeCtx = common::ContextScope::current();
+                core::detail::runOnRoute(root->name(), sql, gateType, routeCtx);
                 std::vector<std::shared_ptr<core::DataSource> > targets;
-                if (policy.isWrite) {
-                    targets = root->writeTargets(); // 组：failover 候选（可空）；叶子：空表
-                    if (targets.empty() && !root->primary_) targets.push_back(root);
-                } else {
-                    auto t = root->readTarget(); // 组：读路由；叶子：null
-                    if (!t) t = root;
-                    targets.push_back(t);
-                    // 读回退：目标非主且允许回退时，主库作为第二候选（逐尝试语义
-                    // 与同步 fallbackToPrimary 一致：目标重试耗尽后才转移）。
-                    if (root->primary_ && root->fallbackToPrimary_ && t != root->primary_)
-                        targets.push_back(root->primary_);
+                {
+                    const common::ContextScope scope(routeCtx);
+                    if (policy.isWrite) {
+                        // 组：shadow 模式下 writeTargets 返回 {shadow_}（§8.3）。
+                        targets = root->writeTargets();
+                        if (targets.empty() && !root->primary_) targets.push_back(root);
+                    } else {
+                        // 组：readTarget 在 shadow 模式下返回 shadow_。
+                        auto t = root->readTarget();
+                        if (!t) t = root;
+                        targets.push_back(t);
+                        // 影子模式下不追加主回退候选——影子不可用就让压测停掉，
+                        // 不让它悄悄降到主库污染生产读路径。
+                        if (!routeCtx.shadow && root->primary_ &&
+                            root->fallbackToPrimary_ && t != root->primary_)
+                            targets.push_back(root->primary_);
+                    }
                 }
 
                 auto ctx = std::make_shared<StatementOp<R> >();
@@ -436,10 +449,12 @@ namespace dbmw::async {
                 ctx->bufferedMaker = std::move(bufferedMaker);
                 ctx->cb = std::move(cb);
                 ctx->policy = policy;
-                // M1 SPI：拍照调用线程栈顶 ctx，worker 跑 attemptFn 前装回
-                // （见 step2Statement 的 ContextScope scope(ctx->entryCtx)），
-                // 保证异步与同步路径下 Session 子语句看到的"业务上下文"形态一致。
-                ctx->entryCtx = common::ContextScope::current();
+                // M1 SPI：拍照调用线程栈顶 ctx（叠加 onRoute 决策后的 routeCtx），
+                // worker 跑 attemptFn 前装回（见 step2Statement 的
+                // ContextScope scope(ctx->entryCtx)），保证异步与同步路径下
+                // Session 子语句看到的"业务上下文"形态一致；routeCtx.shadow
+                // 也会被 I12 写缓冲守卫读到。
+                ctx->entryCtx = std::move(routeCtx);
 
                 // 结果缓存：只做在叶子目标上，key 带叶子自己的名字（与同步一致）。
                 if (policy.cacheable) {
@@ -610,8 +625,15 @@ namespace dbmw::async {
                     if (r.status.ok()) {
                         // 成功后动作：组/叶子的 markWrite（缓存失效 + RAW 标记）
                         // 记在 root 上——同步组路径同样由 dispatchWrite 记在组上。
-                        if (ctx->policy.isWrite) ctx->root->markWrite();
-                        if (ctx->policy.cacheable) {
+                        // M6：影子写不走 markWrite——影子失败不该把生产组拉到
+                        // read-after-write 窗口里，也不该清掉生产的查询缓存。
+                        if (ctx->policy.isWrite && !ctx->entryCtx.shadow)
+                            ctx->root->markWrite();
+                        // M6：影子失败不计入 root 的熔断计数——影子库的事故不该
+                        // 让生产路径被熔断短路（同步 dispatchWrite 影子短路里也
+                        // 不调 afterAttempt，语义同源）。
+                        if (!ctx->entryCtx.shadow) target->afterAttempt(r.status);
+                        if (ctx->policy.cacheable && !ctx->entryCtx.shadow) {
                             if constexpr (std::is_same_v<R, QueryResult>) {
                                 if (!ctx->cacheKey.empty())
                                     target->cacheStore(ctx->cacheKey, r.rows);
@@ -675,8 +697,11 @@ namespace dbmw::async {
                 // 3) 写缓冲（组路径、execute/executeBatch、候选全部耗尽）。
                 //    要求生成键的写不入缓冲：补发时拿不到键（与同步一致，
                 //    该族根本不构造 bufferedMaker）。
-                if (transferable && ctx->policy.isWrite && ctx->policy.allowWriteBuffer &&
-                    ctx->root->primary_
+                // M6 I12：shadow 流量**绝不**入写缓冲——缓冲补发会把压测数据写回
+                // 生产库（影子库自己的失败应让压测停掉，而不是悄悄落主库）。
+                if (transferable && ctx->policy.isWrite && ctx->policy.allowWriteBuffer
+                    && !ctx->entryCtx.shadow
+                    && ctx->root->primary_
                     && ctx->root->writeBuffer_ && ctx->root->writeBuffer_->enabled()
                     && ctx->bufferedMaker) {
                     if (ctx->root->writeBuffer_->enqueue(ctx->bufferedMaker(

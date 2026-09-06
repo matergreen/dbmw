@@ -654,6 +654,68 @@ Using an **enum instead of `bool`** is deliberate: `bool idempotent=false` canno
 
 The async path is identical in source: `async::execute`'s `maxAttempts` reads the stack-top `ContextScope` snapshot taken at submit time (`entryCtx.idempotency`), using the same priority table as the sync `resolveWriteAttempts`. See `tests/dbmw_idempotency_test.cpp` for the behavior matrix (19 assertions across 9 scenarios covering three states × sync/async × reads-unaffected).
 
+## Shadow routing (v0.4.0 M6: cut all traffic for a group to a shadow data source)
+
+Replay production traffic for full-stack load testing: redirect reads and writes to a shadow database to validate a new version under real load without polluting production data. Shadow routing is decided by **the M1 SPI `onRoute`** (any rule works — by `tenantId`, by canary percentage, by HTTP header…) — at the routing layer it is just `ctx.shadow = true`.
+
+**Configuration**: declare the shadow target on the group — it must be a **plain leaf data source**; it cannot be a member of the same group, and it cannot collide with another group name (to avoid reference ambiguity):
+
+```json
+{
+  "datasources": [
+    { "name": "prod",      "type": "mysql",  "host": "primary.db" },
+    { "name": "prod_repl", "type": "mysql",  "host": "replica.db" },
+    { "name": "shadow_db", "type": "mysql",  "host": "shadow.db" }
+  ],
+  "groups": [{
+    "name": "order_svc",
+    "primary": "prod",
+    "replicas": [{ "name": "prod_repl", "weight": 1 }],
+    "shadow": "shadow_db"
+  }]
+}
+```
+
+**Triggering**: via SPI (most common — switch by tenant / canary percentage):
+
+```cpp
+dbmw::DBMW::addInterceptor({
+    .onRoute = [](const std::string&, const std::string&,
+                  dbmw::common::OperationType,
+                  dbmw::common::SqlContext &ctx) {
+        // e.g. cut 1% of traffic to shadow
+        if (shouldReplayToShadow(ctx.tenantId)) ctx.shadow = true;
+    }
+});
+```
+
+Or directly via thread-local `ContextScope` (applies to every call in the same thread/coroutine):
+
+```cpp
+dbmw::common::ContextScope scope({.shadow = true});
+ds->execute("INSERT INTO orders ...", affected);   // lands in shadow_db
+ds->query("SELECT * FROM products ...", rs);        // lands in shadow_db (primary/replica per routing)
+```
+
+**Core invariants when shadow mode is active**:
+
+| Behavior | Rule | Why |
+| --- | --- | --- |
+| Read / write routing | `readTarget()` / `writeTargets()` return `shadow_` when `ctx.shadow == true` | Whole group traffic cut together |
+| **Shadow writes never enter the write buffer** (I12) | `dispatchWrite` shadow short-circuit: attempt shadow, fail returns error directly, no buffered lambda constructed | Buffer replay would write load-test data back to production — data-pollution incident |
+| **Shadow reads never enter the query cache** (I10) | `cacheEligible()` returns `false` when `ctx.shadow == true` | Avoid mixing load-test results into production tenants' cache |
+| Shadow failure | Short-circuit returns error, **no** primary fallback appended to candidates | If shadow is down, stop the load test — do not silently degrade to polluting production |
+| Async path | `entryCtx` snapshots `routeCtx` at submit; `ctx.shadow` read by I12 / I10 guards is identical | Same source of truth across both paths |
+
+**Configuration validation** (run by `addGroup`; any failure returns `ConfigError`):
+
+- The shadow source must exist (already `addDataSource`'d);
+- The shadow source **must not** be the group's primary (self-shadowing);
+- The shadow source **must not** be a replica of the group;
+- The shadow source **must not** collide with any group name.
+
+Validation runs in `resolveShadows` (after `init()` / `addGroup()`, before externally visible). See `tests/dbmw_shadow_test.cpp` for the full behavior matrix (39 assertions across 10 scenarios covering sync / async / cache / write-buffer / validation branches).
+
 ## Async API (v0.2.0: callbacks / futures / coroutines)
 
 The three calling styles share one execution pipeline — governance gates (audit / rate limit / circuit breaker / cache), retry backoff, statement timeout, cancellation — and differ only in how results are delivered. Enable `async` in the config:

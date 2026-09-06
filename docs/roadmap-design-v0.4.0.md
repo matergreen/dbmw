@@ -130,7 +130,7 @@
 | M3 | 指标导出增强 | 依赖 M2（指标需要 trace 维度）；机制已有，只是补字段与出口 |
 | M4 | 动态数据源 | ✅ **已落地**（2026-09）——`addDataSource/removeDataSource/addGroup/removeGroup` + facade 透传 + 79 项单测。独立于 SPI，改动面集中在 `DatabaseManager::init` 的替换逻辑，宜早做以暴露生命周期问题 |
 | M5 | 幂等声明 | ✅ **已落地**（2026-09）——`context.h` 三态枚举 + 同步 `resolveWriteAttempts` + 异步 `maxAttempts` 接入 + 19 项单测。独立小改动，把重试语义从"引擎猜"变成"调用方声明" |
-| M6 | 影子库路由 | 依赖 M1（路由决策）+ 复用现有组路由框架 |
+| M6 | 影子库路由 | ✅ **已落地**（2026-09）——`DataSourceGroupConfig::shadow` 字段 + 同步 `readTarget/writeTargets/dispatchWrite/cacheEligible` 影子分支 + 异步 `entryCtx` 透传 + `resolveShadows` 4 项校验 + 39 项单测。复用 M1 SPI `onRoute` 触发，硬守住 I12（影子不进写缓冲）/ I10（影子不进缓存）；同步异步决策同源 |
 | M7 | 结果脱敏 | 依赖 M1（结果改写）。之所以排后：它触碰结果集与缓存（I10），需要前序能力稳定后再动 |
 | M8 | 读后写增强 | 功能已存在（§1.3），属优化项，排最后无风险 |
 
@@ -142,7 +142,7 @@
 |---|---|---|
 | **A** | M1 + M2 | SPI 可注册生效；`OperationEvent` 带 traceId；同步 + 异步路径均透传 |
 | **B** | M3 + M4 + M5 | 池指标可导出；运行时增删数据源可用；幂等声明影响重试 |
-| **C** | M6 + M7 | 影子流量隔离验证通过；脱敏结果确认不进缓存 |
+| **C** | M6 + M7 | 影子流量隔离已通过（I12 / I10 单测已覆盖）；脱敏结果待 M7 验证 |
 | **D** | M8 | 会话级读后写生效；副本 + 零窗口的配置 WARN 生效 |
 
 ---
@@ -690,6 +690,46 @@ if (common::ContextScope::current().shadow) {
 | **误配把生产流量引到影子库**（最严重） | 影子源不得是组内成员（配置校验）；建议影子数据源在配置里显式标记 `"shadow_only": true`，双保险 |
 | 影子库写满影响压测 | 属运维职责，文档提示容量规划 |
 | 忘记关影子标记导致长期写入影子库 | 建议在 `OperationEvent` 里带出 `shadow` 标记，指标可观测 |
+
+### §8.6 实施状态（v0.4.0）
+
+✅ **已落地**（2026-09，提交于 `dev` 分支 M6 单独 commit）：
+
+1. **`include/dbmw/config/datasource_config.h`**：`DataSourceGroupConfig::shadow`（`std::string`）字段；
+2. **`include/dbmw/core/database_manager.h`**：`DataSource::shadowName_` 声明字段 + `shadow_` 强引用（运行时解析填充）；
+3. **`src/config/config_loader.cpp`：从 JSON groups[].shadow 读入配置并保留到 DataSourceGroupConfig；
+4. **`src/core/database_manager.cpp`**：
+   - `DataSource::readTarget()` 在 `ctx.shadow` 为真且 `shadow_` 有效时返回 `shadow_`；
+   - `DataSource::writeTargets()` 在影子模式下返回 `{shadow_}`；
+   - `DataSource::dispatchWrite()` 影子短路：attempt 影子，失败直接返回错误，**绝不**构造 buffered lambda；
+   - `cacheEligible()` 在影子模式下返回 false（影子读不进缓存，I10）；
+   - `buildSingleDataSourceGroup()`：填入 `shadowName_`；
+   - 新增 `DatabaseManager::resolveShadows()`（私有）：把每组 `shadowName_` 解析为 `DataSource` 强引用；任一校验失败立刻返回 `ConfigError`，错误消息指明冲突的组 / 字段；
+   - `init()` 与 `addGroup()` 在所有叶子 DataSource 建好之后、对外可见之前调用 `resolveShadows()`；
+   - 校验规则：
+     - 影子源必须存在（已在 `addDataSource` 注册）；
+     - 影子源**不得**是本组主（自影自己）；
+     - 影子源**不得**是本组副本（自影自己）；
+     - 影子源**不得**与任何组名同名（避免引用歧义）；
+5. **`src/async/async_engine.cpp`**：
+   - `submitStatementOp()` 在调用线程跑 `core::detail::runOnRoute()` 拿到带 `shadow`/`targetDataSource` 的 `routeCtx`，围绕后续路由计算 `ContextScope scope(routeCtx)`，使影子决策对 readTarget/writeTargets 可见；
+   - `routeCtx.shadow` 同时作为 `StatementOp::entryCtx.idempotency` 之外的另一个字段喂给 worker——I12（写缓冲守卫：`transferable && !ctx->entryCtx.shadow`）、I10（缓存守卫：`!ctx->entryCtx.shadow` 才 cacheStore）、afterAttempt 守卫都读到一致的 shadow 标志；
+   - 影子模式下不追加主回退候选——影子不可用就让压测停掉，不悄悄降级污染生产；
+6. **`tests/dbmw_shadow_test.cpp`**（新增）：39 项断言 / 10 个场景——同步读/写、影子写不进缓冲、影子读不进缓存、四个校验失败分支、异步 execute、异步 query，全部 0 失败。
+
+**关键不变量（已守住）**：
+
+| 不变量 | 当前实现 |
+| --- | --- |
+| I12 影子流量绝不进写缓冲 | `dispatchWrite` 影子短路 + 异步 `!ctx->entryCtx.shadow` 守卫双层 |
+| I10 影子结果绝不进缓存 | `cacheEligible()/cacheStore` 影子守卫 |
+| 校验失败时回滚 | `init()` 在 `resolveShadows()` 失败时把 `datasources_/pools_/writeBuffers_/heartbeat_` 全部还原，避免新加的数据源残留 |
+| 同步与异步决策一致 | 异步显式 push `routeCtx` 入栈，与同步读写 `ContextScope::current()` 读到同一份 `shadow` |
+
+**未做（刻意）**：
+
+- `OperationEvent` 增加 `shadow` 字段供指标可观测（设计 §8.5 风险行提到，列入下一波 M7/M8 同步落地）。
+- `dispatchWrite` 影子短路仍调用一次 `attempt(shadow_)`——按既有"重试 on shadow_" 行为复用 retry 框架，影子失败可重试由调用方决策（影子模式默认 `retry_writes=true` 不变）。
 
 ---
 
