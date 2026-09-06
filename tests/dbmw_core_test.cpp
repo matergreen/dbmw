@@ -1538,6 +1538,90 @@ int main() {
         candidatePool->shutdown(std::chrono::milliseconds(0));
     }
 
+    std::cout << "== 46. 生命周期：移动赋值先清理目标 Session 的未结束事务 ==\n";
+    {
+        MockConnection::resetLog();
+        auto pool = makePool(0, 2);
+        core::DataSource ds(pool, "move-session");
+        const auto status = ds.withSession([&](core::Session &target) {
+            if (const auto begun = target.begin(); !begun.ok()) return begun;
+            return ds.withSession([&](core::Session &source) {
+                target = std::move(source);
+                return Status::OK();
+            });
+        });
+        check(status.ok() && MockConnection::joined().find("rollback") != std::string::npos,
+              "移动覆盖前回滚目标 Session，半事务连接不会归池\n          实际: "
+              + MockConnection::joined());
+        pool->shutdown(std::chrono::milliseconds(0));
+    }
+
+    std::cout << "== 47. 高风险语义与扩展类型：必须显式确认且类型不丢失 ==\n";
+    {
+        const auto path = (std::filesystem::temp_directory_path()
+                           / "dbmw_failover_ack_test.json").string();
+        auto load = [&](const std::string &failover, config::GlobalConfig &parsed,
+                        std::string &error) {
+            std::ofstream file(path);
+            file << "{\"default_datasource\":\"g\",\"datasources\":["
+                    "{\"name\":\"p\",\"type\":\"mock\"},"
+                    "{\"name\":\"s\",\"type\":\"mock\"}],"
+                    "\"groups\":[{\"name\":\"g\",\"primary\":\"p\","
+                    "\"failover\":" << failover << "}]}";
+            file.close();
+            return config::ConfigLoader::loadFromFile(path, parsed, error);
+        };
+
+        config::GlobalConfig parsed;
+        std::string error;
+        check(!load("{\"primaries\":[\"s\"]}", parsed, error) &&
+              error.find("acknowledge_external_fencing") != std::string::npos,
+              "自动写故障转移未确认外部 fencing 时拒绝配置");
+        error.clear();
+        check(!load("{\"write_buffer\":{\"enabled\":true}}", parsed, error) &&
+              error.find("acknowledge_data_loss_and_duplicates") != std::string::npos,
+              "易失写缓冲未确认丢失与重复风险时拒绝配置");
+        error.clear();
+        check(load("{\"primaries\":[\"s\"],"
+                   "\"acknowledge_external_fencing\":true,"
+                   "\"write_buffer\":{\"enabled\":true,"
+                   "\"acknowledge_data_loss_and_duplicates\":true}}",
+                   parsed, error) &&
+              parsed.groups[0].failover.acknowledge_external_fencing &&
+              parsed.groups[0].failover.write_buffer.acknowledge_data_loss_and_duplicates,
+              "显式确认后保留故障转移与写缓冲配置");
+        parsed.groups[0].failover.acknowledge_external_fencing = false;
+        core::DatabaseManager unsafeManager;
+        check(unsafeManager.init(parsed).code == common::ErrorCode::ConfigError,
+              "程序化 GlobalConfig 入口同样不能绕过 fencing 风险确认");
+        unsafeManager.shutdown(std::chrono::milliseconds(0));
+        std::remove(path.c_str());
+
+        const common::Params typed{
+            std::uint64_t{18446744073709551615ULL}, common::Decimal{"1234567890.123456789"},
+            common::Date{"2026-09-06"}, common::Time{"11:50:00.123456"},
+            common::Uuid{"550e8400-e29b-41d4-a716-446655440000"},
+            common::Json{"{\"ok\":true}"}};
+        check(common::paramTypeSignature(typed) == "umaogj",
+              "扩展类型拥有互不冲突的预编译参数签名");
+        check(common::valueToString(typed[1]) == "1234567890.123456789" &&
+              common::escapeLiteralGeneric(typed[0]) == "18446744073709551615" &&
+              common::escapeLiteralGeneric(typed[5]) == "'{\"ok\":true}'",
+              "Decimal/uint64/JSON 的诊断与字面量渲染保持原值");
+        MockConnection renderer;
+        common::SqlRenderOptions renderOptions;
+        std::string rendered;
+        check(renderer.renderSqlForLogging("SELECT ?", {common::Json{"{\"secret\":1}"}},
+                                               renderOptions, rendered).ok() &&
+              rendered.find("secret") == std::string::npos,
+              "JSON/UUID 等文本强类型沿用字符串参数的默认脱敏策略");
+        renderOptions.includeStringValues = true;
+        check(renderer.renderSqlForLogging("SELECT ?", {common::Decimal{"1;DROP TABLE t"}},
+                                               renderOptions, rendered).ok() &&
+              rendered == "SELECT '1;DROP TABLE t'",
+              "强类型诊断值经驱动转义，不会被当作原始 SQL 片段");
+    }
+
     std::cout << "\n----------------------------------------\n";
     std::cout << "通过 " << g_passed << " 项，失败 " << g_failed << " 项\n";
     return g_failed == 0 ? 0 : 1;

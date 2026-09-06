@@ -8,12 +8,24 @@ target_link_libraries(dbmw_core_test PRIVATE dbmw)
 add_executable(dbmw_async_test dbmw_async_test.cpp)
 target_link_libraries(dbmw_async_test PRIVATE dbmw)
 
-# 真实 PostgreSQL 集成测试。默认不构建，避免普通单元测试依赖外部服务；
-# 开启时由 DBMW_TEST_PG_* 环境变量提供连接信息，测试只操作自己的临时 schema。
+# 真实数据库集成测试默认不构建，避免普通单元测试依赖外部服务；
+# 开启时由各 DBMW_TEST_* 环境变量提供连接信息，测试只操作自己的临时对象。
 if(DBMW_BUILD_INTEGRATION_TESTS AND DBMW_ENABLE_POSTGRES)
     add_executable(dbmw_postgres_integration_test dbmw_postgres_integration_test.cpp)
     target_link_libraries(dbmw_postgres_integration_test PRIVATE dbmw)
     add_test(NAME dbmw_postgres_integration_test COMMAND dbmw_postgres_integration_test)
+endif()
+
+if(DBMW_BUILD_INTEGRATION_TESTS AND DBMW_ENABLE_MYSQL)
+    add_executable(dbmw_mysql_integration_test dbmw_mysql_integration_test.cpp)
+    target_link_libraries(dbmw_mysql_integration_test PRIVATE dbmw)
+    add_test(NAME dbmw_mysql_integration_test COMMAND dbmw_mysql_integration_test)
+endif()
+
+if(DBMW_BUILD_INTEGRATION_TESTS AND DBMW_ENABLE_ODBC)
+    add_executable(dbmw_odbc_integration_test dbmw_odbc_integration_test.cpp)
+    target_link_libraries(dbmw_odbc_integration_test PRIVATE dbmw)
+    add_test(NAME dbmw_odbc_integration_test COMMAND dbmw_odbc_integration_test)
 endif()
 
 # T15 协程层测试：仅在 DBMW_ENABLE_ASYNC_CORO=ON 时构建。
@@ -37,6 +49,12 @@ if(Threads_FOUND)
     endif()
     if(TARGET dbmw_postgres_integration_test)
         target_link_libraries(dbmw_postgres_integration_test PRIVATE Threads::Threads)
+    endif()
+    if(TARGET dbmw_mysql_integration_test)
+        target_link_libraries(dbmw_mysql_integration_test PRIVATE Threads::Threads)
+    endif()
+    if(TARGET dbmw_odbc_integration_test)
+        target_link_libraries(dbmw_odbc_integration_test PRIVATE Threads::Threads)
     endif()
 endif()
 

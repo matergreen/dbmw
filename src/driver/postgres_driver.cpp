@@ -134,10 +134,14 @@ namespace dbmw::driver {
         static constexpr pqxx::oid kInt2 = 21;      // smallint
         static constexpr pqxx::oid kInt4 = 23;      // integer
         static constexpr pqxx::oid kDate = 1082;    // date
-        static constexpr pqxx::oid kTime = 1083;    // time（无对应值类型，保留为字符串）
+        static constexpr pqxx::oid kTime = 1083;
         static constexpr pqxx::oid kTimestamp = 1114;  // timestamp
         static constexpr pqxx::oid kTimestamptz = 1184;// timestamptz
-        static constexpr pqxx::oid kNumeric = 1700; // numeric（以字符串保留，避免精度损失）
+        static constexpr pqxx::oid kTimetz = 1266;
+        static constexpr pqxx::oid kNumeric = 1700;
+        static constexpr pqxx::oid kJson = 114;
+        static constexpr pqxx::oid kJsonb = 3802;
+        static constexpr pqxx::oid kUuid = 2950;
         static constexpr pqxx::oid kFloat4 = 700;   // real
         static constexpr pqxx::oid kFloat8 = 701;   // double precision
 
@@ -157,9 +161,14 @@ namespace dbmw::driver {
                     case kInt8:   return Value{static_cast<std::int64_t>(f.template as<long long>())};
                     case kFloat4:
                     case kFloat8: return Value{f.template as<double>()};
-                    case kNumeric:return Value{f.template as<std::string>()};
+                    case kNumeric:return Value{common::Decimal{f.template as<std::string>()}};
                     case kBytea:  return Value{parseBytea(f.template as<std::string>())};
-                    case kDate:
+                    case kDate:   return Value{common::Date{f.template as<std::string>()}};
+                    case kTime:
+                    case kTimetz: return Value{common::Time{f.template as<std::string>()}};
+                    case kUuid:   return Value{common::Uuid{f.template as<std::string>()}};
+                    case kJson:
+                    case kJsonb:  return Value{common::Json{f.template as<std::string>()}};
                     case kTimestamp:
                     case kTimestamptz: {
                         const std::string s = f.template as<std::string>();
@@ -213,10 +222,24 @@ namespace dbmw::driver {
                     p.append(std::optional<bool>{*x});
                 } else if (const auto *x = std::get_if<std::int64_t>(&v)) {
                     p.append(std::optional<long long>{static_cast<long long>(*x)});
+                } else if (const auto *x = std::get_if<std::uint64_t>(&v)) {
+                    // PostgreSQL 没有 unsigned bigint；以十进制文本发送，由目标列
+                    // 类型决定是否接受，避免在客户端静默溢出。
+                    p.append(std::optional<std::string>{std::to_string(*x)});
                 } else if (const auto *x = std::get_if<double>(&v)) {
                     p.append(std::optional<double>{*x});
+                } else if (const auto *x = std::get_if<common::Decimal>(&v)) {
+                    p.append(std::optional<std::string>{x->value});
                 } else if (const auto *x = std::get_if<common::Timestamp>(&v)) {
                     p.append(std::optional<std::string>{common::timestampToStringMs(*x)});
+                } else if (const auto *x = std::get_if<common::Date>(&v)) {
+                    p.append(std::optional<std::string>{x->value});
+                } else if (const auto *x = std::get_if<common::Time>(&v)) {
+                    p.append(std::optional<std::string>{x->value});
+                } else if (const auto *x = std::get_if<common::Uuid>(&v)) {
+                    p.append(std::optional<std::string>{x->value});
+                } else if (const auto *x = std::get_if<common::Json>(&v)) {
+                    p.append(std::optional<std::string>{x->value});
                 } else if (const auto *x = std::get_if<common::Blob>(&v)) {
                     p.append(std::optional<std::string>{toByteaHex(*x)});
                 } else if (const auto *x = std::get_if<std::string>(&v)) {

@@ -152,7 +152,8 @@ struct Fixture {
             "CREATE TABLE " + table + " ("
             "id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, qty BIGINT NOT NULL, "
             "price DOUBLE PRECISION NOT NULL, active BOOLEAN NOT NULL, payload BYTEA, "
-            "created_at TIMESTAMPTZ NOT NULL)", affected), "create table");
+            "amount NUMERIC(30,9), due_date DATE, local_time TIME, external_id UUID, "
+            "metadata JSONB, created_at TIMESTAMPTZ NOT NULL)", affected), "create table");
     }
 };
 
@@ -167,18 +168,26 @@ void testConnectivityAndTypes(Fixture &f) {
     require(ds != nullptr, "default datasource is missing");
     const dbmw::common::Timestamp timestamp = std::chrono::system_clock::now();
     const dbmw::common::Blob blob{0x00, 0x01, 0x7f, 0x80, 0xff};
+    const dbmw::common::Decimal amount{"123456789012345678901.123456789"};
+    const dbmw::common::Date dueDate{"2026-09-06"};
+    const dbmw::common::Time localTime{"11:50:00.123456"};
+    const dbmw::common::Uuid externalId{"550e8400-e29b-41d4-a716-446655440000"};
+    const dbmw::common::Json metadata{"{\"source\":\"integration\",\"ok\":true}"};
     dbmw::common::GeneratedKeys keys;
     std::int64_t affected = 0;
     requireOk(ds->execute(
         "INSERT INTO " + f.table
-        + " (name, qty, price, active, payload, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
-        Params{std::string("alpha"), std::int64_t(7), 12.5, true, blob, timestamp},
+        + " (name, qty, price, active, payload, amount, due_date, local_time, external_id, "
+          "metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        Params{std::string("alpha"), std::int64_t(7), 12.5, true, blob, amount, dueDate,
+               localTime, externalId, metadata, timestamp},
         affected, keys), "insert with RETURNING");
     require(affected == 1 && keys.lastInsertId() > 0, "generated key or affected rows is wrong");
 
     ResultSet rows;
     requireOk(dbmw::DBMW::query(
-        "SELECT name, qty, price, active, payload, created_at FROM " + f.table + " WHERE id = ?",
+        "SELECT name, qty, price, active, payload, amount, due_date, local_time, external_id, "
+        "metadata, created_at FROM " + f.table + " WHERE id = ?",
         Params{keys.lastInsertId()}, rows), "type round trip");
     require(rows.rowCount() == 1, "type round trip returned wrong row count");
     const auto &row = rows.rows()[0];
@@ -188,6 +197,18 @@ void testConnectivityAndTypes(Fixture &f) {
             "double round trip failed");
     require(std::get<bool>(row.at("active")), "boolean round trip failed");
     require(std::get<dbmw::common::Blob>(row.at("payload")) == blob, "bytea round trip failed");
+    require(std::get<dbmw::common::Decimal>(row.at("amount")) == amount,
+            "numeric round trip lost precision");
+    require(std::get<dbmw::common::Date>(row.at("due_date")) == dueDate,
+            "date round trip failed");
+    require(std::get<dbmw::common::Time>(row.at("local_time")) == localTime,
+            "time round trip failed");
+    require(std::get<dbmw::common::Uuid>(row.at("external_id")) == externalId,
+            "uuid round trip failed");
+    require(std::holds_alternative<dbmw::common::Json>(row.at("metadata")) &&
+            std::get<dbmw::common::Json>(row.at("metadata")).value.find("integration") !=
+                std::string::npos,
+            "jsonb round trip failed");
     require(std::holds_alternative<dbmw::common::Timestamp>(row.at("created_at")),
             "timestamptz was not mapped to Timestamp");
 
@@ -316,7 +337,7 @@ void testErrorsLimitsAndCursor(Fixture &f) {
     require(cursorLimit.code == ErrorCode::CursorLimit, "max_open_cursors was not enforced");
 
     ResultSet streamed;
-    while (cursor->isOpen()) requireOk(cursor->fetch(2, streamed), "cursor fetch");
+    while (cursor->hasNext()) requireOk(cursor->fetch(2, streamed), "cursor fetch");
     require(streamed.rowCount() >= 5, "cursor did not stream all rows");
     requireOk(cursor->close(), "cursor close");
     dbmw::core::ConnectionPool::Stats stats;

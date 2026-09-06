@@ -174,6 +174,9 @@ namespace dbmw::core {
                     } else if constexpr (std::is_same_v<T, std::int64_t>) {
                         key.push_back('i');
                         key += std::to_string(value);
+                    } else if constexpr (std::is_same_v<T, std::uint64_t>) {
+                        key.push_back('u');
+                        key += std::to_string(value);
                     } else if constexpr (std::is_same_v<T, double>) {
                         // 按位序列化：十进制文本化会丢精度，
                         // 两个不相等的 double 可能打印出同一串字符。
@@ -189,6 +192,19 @@ namespace dbmw::core {
                         key += std::to_string(value.size());
                         key.push_back(':');
                         key += value;
+                    } else if constexpr (std::is_same_v<T, common::Decimal> ||
+                                         std::is_same_v<T, common::Date> ||
+                                         std::is_same_v<T, common::Time> ||
+                                         std::is_same_v<T, common::Uuid> ||
+                                         std::is_same_v<T, common::Json>) {
+                        if constexpr (std::is_same_v<T, common::Decimal>) key.push_back('m');
+                        else if constexpr (std::is_same_v<T, common::Date>) key.push_back('a');
+                        else if constexpr (std::is_same_v<T, common::Time>) key.push_back('o');
+                        else if constexpr (std::is_same_v<T, common::Uuid>) key.push_back('g');
+                        else key.push_back('j');
+                        key += std::to_string(value.value.size());
+                        key.push_back(':');
+                        key += value.value;
                     } else {
                         key.push_back('x');
                         key += std::to_string(value.size());
@@ -205,6 +221,10 @@ namespace dbmw::core {
     // Session
     // -----------------------------------------------------------------------
     Session::~Session() {
+        cleanupOpenTransaction();
+    }
+
+    void Session::cleanupOpenTransaction() noexcept {
         if (!txOpen_ || !h_) return;
         // 析构函数绝不能抛异常，这里把驱动的任何异常都吞掉。
         try {
@@ -1789,6 +1809,24 @@ namespace dbmw::core {
                 return common::Status::error(common::ErrorCode::ConfigError,
                                              "duplicate datasource/group name: " + group.name);
             }
+            // init(GlobalConfig) 也是公开入口，不能只依赖 JSON Loader 校验；
+            // 程序化构造配置同样必须显式确认高风险写语义。
+            if (!group.failover.primaries.empty() &&
+                !group.failover.acknowledge_external_fencing) {
+                return common::Status::error(
+                    common::ErrorCode::ConfigError,
+                    "group '" + group.name
+                    + "' configures automatic write failover without acknowledging "
+                      "external fencing");
+            }
+            if (group.failover.write_buffer.enabled &&
+                !group.failover.write_buffer.acknowledge_data_loss_and_duplicates) {
+                return common::Status::error(
+                    common::ErrorCode::ConfigError,
+                    "group '" + group.name
+                    + "' enables volatile write buffering without acknowledging data-loss "
+                      "and duplicate-replay risk");
+            }
             const auto primaryIt = newSources.find(group.primary);
             if (primaryIt == newSources.end() || newPools.find(group.primary) == newPools.end()) {
                 return common::Status::error(
@@ -1855,6 +1893,9 @@ namespace dbmw::core {
                         + "' is read_only but enables failover.write_buffer;"
                           " a read-only group never writes");
                 }
+                DBMW_LOG_WARN("group [" + group.name
+                              + "] volatile write buffer enabled: Buffered means accepted, not "
+                                "committed; process failure may lose writes and replay may duplicate them");
                 WriteBuffer::Config wbc;
                 wbc.enabled = true;
                 wbc.max_queue = group.failover.write_buffer.max_queue;

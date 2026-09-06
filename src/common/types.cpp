@@ -5,6 +5,7 @@
 #include <cmath>
 #include <iomanip>
 #include <istream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <variant>
@@ -202,13 +203,19 @@ namespace dbmw::common {
         if (std::holds_alternative<std::nullptr_t>(v)) return "NULL";
         if (const auto *p = std::get_if<bool>(&v)) return *p ? "true" : "false";
         if (const auto *p = std::get_if<std::int64_t>(&v)) return std::to_string(*p);
+        if (const auto *p = std::get_if<std::uint64_t>(&v)) return std::to_string(*p);
         if (const auto *p = std::get_if<double>(&v)) {
             std::ostringstream os;
             os << std::setprecision(17) << *p;
             return os.str();
         }
+        if (const auto *p = std::get_if<Decimal>(&v)) return p->value;
         if (const auto *p = std::get_if<std::string>(&v)) return *p;
+        if (const auto *p = std::get_if<Date>(&v)) return p->value;
+        if (const auto *p = std::get_if<Time>(&v)) return p->value;
         if (const auto *p = std::get_if<Timestamp>(&v)) return timestampToStringMs(*p);
+        if (const auto *p = std::get_if<Uuid>(&v)) return p->value;
+        if (const auto *p = std::get_if<Json>(&v)) return p->value;
         if (const auto *p = std::get_if<Blob>(&v)) {
             std::string s = "blob[" + std::to_string(p->size()) + "]:";
             const size_t show = std::min<size_t>(p->size(), 16);
@@ -230,6 +237,7 @@ namespace dbmw::common {
         if (std::holds_alternative<std::nullptr_t>(v)) return "NULL";
         if (const auto *p = std::get_if<bool>(&v)) return *p ? "TRUE" : "FALSE";
         if (const auto *p = std::get_if<std::int64_t>(&v)) return std::to_string(*p);
+        if (const auto *p = std::get_if<std::uint64_t>(&v)) return std::to_string(*p);
         if (const auto *p = std::get_if<double>(&v)) {
             // NaN/Inf 无法用 SQL 字面量表达，退化成 NULL 而不是产生语法错误。
             if (!std::isfinite(*p)) return "NULL";
@@ -243,6 +251,17 @@ namespace dbmw::common {
             s += '\'';
             return s;
         }
+        const auto quoteText = [](const std::string &text) {
+            std::string s = "'";
+            for (const char c: text) s += c == '\'' ? "''" : std::string(1, c);
+            s += '\'';
+            return s;
+        };
+        if (const auto *p = std::get_if<Decimal>(&v)) return quoteText(p->value);
+        if (const auto *p = std::get_if<Date>(&v)) return quoteText(p->value);
+        if (const auto *p = std::get_if<Time>(&v)) return quoteText(p->value);
+        if (const auto *p = std::get_if<Uuid>(&v)) return quoteText(p->value);
+        if (const auto *p = std::get_if<Json>(&v)) return quoteText(p->value);
         if (const auto *p = std::get_if<Blob>(&v)) {
             // 标准 SQL 的二进制字面量写法。方言差异较大，
             // 具体驱动应覆盖 escapeLiteral() 给出本方言的正确形式。
@@ -291,6 +310,10 @@ namespace dbmw::common {
 
         const Value &v = firstRow.at(column);
         if (const auto *i = std::get_if<std::int64_t>(&v)) return *i;
+        if (const auto *i = std::get_if<std::uint64_t>(&v)) {
+            return *i <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
+                ? static_cast<std::int64_t>(*i) : 0;
+        }
         // PG / ODBC 的 RETURNING 可能把 int8 以文本形式送回，容错解析一次。
         if (const auto *s = std::get_if<std::string>(&v)) {
             try {
@@ -348,10 +371,16 @@ namespace dbmw::common {
             if (std::holds_alternative<std::nullptr_t>(v)) sig.push_back('n');
             else if (std::holds_alternative<bool>(v)) sig.push_back('b');
             else if (std::holds_alternative<std::int64_t>(v)) sig.push_back('i');
+            else if (std::holds_alternative<std::uint64_t>(v)) sig.push_back('u');
             else if (std::holds_alternative<double>(v)) sig.push_back('d');
+            else if (std::holds_alternative<Decimal>(v)) sig.push_back('m');
             else if (std::holds_alternative<std::string>(v)) sig.push_back('s');
+            else if (std::holds_alternative<Date>(v)) sig.push_back('a');
+            else if (std::holds_alternative<Time>(v)) sig.push_back('o');
             else if (std::holds_alternative<Timestamp>(v)) sig.push_back('t');
-            else sig.push_back('x'); // Blob：Value 变体的兜底分支
+            else if (std::holds_alternative<Uuid>(v)) sig.push_back('g');
+            else if (std::holds_alternative<Json>(v)) sig.push_back('j');
+            else sig.push_back('x');
         }
         return sig;
     }

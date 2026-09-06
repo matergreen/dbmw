@@ -189,6 +189,9 @@ namespace dbmw::config {
     // 不代表已提交；进程崩溃会丢数据，且绝不用于事务。
     struct WriteBufferConfig {
         bool enabled = false;
+        // 内存缓冲不提供持久化、幂等或 exactly-once。开启者必须显式确认
+        // 进程崩溃可能丢写、补发可能产生重复，避免把 Buffered 当提交回执。
+        bool acknowledge_data_loss_and_duplicates = false;
         int max_queue = 1000;
         int ttl_ms = 30000;          // 入队后最多保留时长，超时丢弃
         int flush_interval_ms = 1000; // 后台 flush 周期
@@ -198,6 +201,9 @@ namespace dbmw::config {
     struct FailoverConfig {
         // 有序可写候选（不含主；主自动置顶）。第一个健康者被选中。
         std::vector<std::string> primaries;
+        // dbmw 不负责集群选主或 fencing。配置自动写切换时必须显式确认
+        // 外部系统已保证候选中同一时刻只有一个节点可写。
+        bool acknowledge_external_fencing = false;
         // 仅按熔断状态判断"健康"（v1）。真正的复制滞后需由外部健康信号提供。
         bool require_healthy = false;
         WriteBufferConfig write_buffer;

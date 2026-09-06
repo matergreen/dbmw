@@ -444,9 +444,17 @@ namespace dbmw::config {
                     }
                 }
                 group.read_only = g.value("read_only", false);
-                if (g.contains("failover") && g["failover"].is_object()) {
+                if (g.contains("failover") && !g["failover"].is_object()) {
+                    error = "group '" + group.name + "' failover must be an object";
+                    return false;
+                }
+                if (g.contains("failover")) {
                     const auto &fo = g["failover"];
-                    if (fo.contains("primaries") && fo["primaries"].is_array()) {
+                    if (fo.contains("primaries") && !fo["primaries"].is_array()) {
+                        error = "group '" + group.name + "' failover.primaries must be an array";
+                        return false;
+                    }
+                    if (fo.contains("primaries")) {
                         for (const auto &p: fo["primaries"]) {
                             if (!p.is_string() || p.get<std::string>().empty()) {
                                 error = "group '" + group.name
@@ -457,9 +465,17 @@ namespace dbmw::config {
                         }
                     }
                     group.failover.require_healthy = fo.value("require_healthy", false);
-                    if (fo.contains("write_buffer") && fo["write_buffer"].is_object()) {
+                    group.failover.acknowledge_external_fencing =
+                        fo.value("acknowledge_external_fencing", false);
+                    if (fo.contains("write_buffer") && !fo["write_buffer"].is_object()) {
+                        error = "group '" + group.name + "' failover.write_buffer must be an object";
+                        return false;
+                    }
+                    if (fo.contains("write_buffer")) {
                         const auto &wb = fo["write_buffer"];
                         group.failover.write_buffer.enabled = wb.value("enabled", false);
+                        group.failover.write_buffer.acknowledge_data_loss_and_duplicates =
+                            wb.value("acknowledge_data_loss_and_duplicates", false);
                         group.failover.write_buffer.max_queue = wb.value("max_queue", 1000);
                         group.failover.write_buffer.ttl_ms = wb.value("ttl_ms", 30000);
                         group.failover.write_buffer.flush_interval_ms =
@@ -470,6 +486,21 @@ namespace dbmw::config {
                             error = "invalid group '" + group.name + "' failover.write_buffer";
                             return false;
                         }
+                    }
+                    if (!group.failover.primaries.empty() &&
+                        !group.failover.acknowledge_external_fencing) {
+                        error = "group '" + group.name
+                            + "' configures automatic write failover without "
+                              "failover.acknowledge_external_fencing=true; dbmw does not "
+                              "perform leader election or fencing";
+                        return false;
+                    }
+                    if (group.failover.write_buffer.enabled &&
+                        !group.failover.write_buffer.acknowledge_data_loss_and_duplicates) {
+                        error = "group '" + group.name
+                            + "' enables the volatile write buffer without "
+                              "failover.write_buffer.acknowledge_data_loss_and_duplicates=true";
+                        return false;
                     }
                 }
                 out.groups.push_back(std::move(group));

@@ -109,6 +109,7 @@ namespace dbmw::driver {
         // 预编译语句连接级缓存：key = SQL + 参数类型签名。句柄存原生 SQLHSTMT；
         // 连接归还池后缓存保留，随连接关闭（closeAllPrepared -> SQLFreeHandle）释放。
         std::unordered_map<std::string, core::PreparedStatementHandle> preparedCache_;
+        std::unordered_map<std::uint64_t, std::string> preparedKeys_;
         std::list<std::string> preparedLru_;
         std::uint64_t preparedSeq_ = 0;
         int preparedLimit_ = 0;

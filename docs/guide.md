@@ -15,7 +15,7 @@
 - **参数化查询**：`?` 占位符 + 绑定参数，杜绝 SQL 字符串拼接带来的注入风险。
 - **预编译语句 / 生成键 / 大参数流式**：连接级预编译句柄缓存（热点 SQL 透明只 prepare 一次）、`execute` 回吐自增主键（`GeneratedKeys`）、超大 BLOB 按块流式写入（`StreamSource`）。详见下文「预编译语句 / 生成键 / 大参数流式」一节。
 - **韧性与路由**：只读查询安全重试、指数退避、熔断/半开、主从读写路由及写后读窗口。
-- **主库故障转移**：写路径在主不可用时按序切换到候选备用库；全部不可用时可选写缓冲软降级（后台补发，返回 `Buffered`），但绝不用于事务。
+- **主库故障转移**：在外部系统已保证单主/fencing 且配置显式确认后，写路径才会按序切换候选；易失写缓冲也需单独确认丢失与重复风险，且绝不用于事务。
 - **限流与背压**：按数据源总 QPS 与（可选）单 SQL 指纹 QPS 做令牌桶限速，超限快速失败返回 `RateLimited`，不重试、不打满连接池。
 - **SQL 审计与拦截**：执行前对 SQL 做轻量静态分析，可拦截无 WHERE 的 UPDATE/DELETE、无 LIMIT 的 SELECT、只读数据源上的写，以及按指纹黑名单/白名单拦截；灰度期 `action=warn` 仅告警。
 - **查询结果缓存**：按 `(数据源 + 原始SQL + 类型标记参数)` 缓存非事务读，LRU + TTL + 内存上限，写后按数据源失效；默认关闭。
@@ -31,7 +31,7 @@
   并预留**驱动扩展接口**，新增数据库只需实现 `IDriver` 并注册。
 
 > 状态：核心层（配置/连接池/心跳/事务/参数绑定/门面）已完整实现，
-> 并通过 `tests/dbmw_core_test.cpp` 的 137 项行为验证（mock 驱动，无需真实数据库）。
+> 并通过 `tests/dbmw_core_test.cpp` 的 146 项行为验证（mock 驱动，无需真实数据库）。
 >
 > 驱动实现进度：
 > - **MySQL 已完整实现**（libmysqlclient）：连接超时/字符集、ping、按列类型映射结果集、
@@ -189,6 +189,19 @@ auto st = dbmw::DBMW::query("SELECT * FROM t WHERE name = ? AND age > ?", p, rs)
 - 仅明确覆盖 `allowsLiteralInterpolation()` 的兼容驱动才会启用字面量插值；扫描器会跳过
   字符串、标识符与注释里的 `?`。
 - 占位符数量与参数数量不一致时返回 `QueryError`，不会静默产生错误 SQL。
+
+常用数据库专有类型会保留语义，而不是全部退化成 `string`/`double`：
+
+| C++ 类型 | 数据库类型 | 说明 |
+|---|---|---|
+| `std::uint64_t` | MySQL unsigned integer | 完整覆盖 `BIGINT UNSIGNED`；PostgreSQL 绑定时以十进制文本发送 |
+| `common::Decimal` | DECIMAL / NUMERIC | 保存原始十进制文本，金额和高精度数不会经过 `double` |
+| `common::Date` / `common::Time` | DATE / TIME | 与时间点 `Timestamp` 分开，避免日期、时刻被错误附加时区 |
+| `common::Uuid` | PostgreSQL UUID / ODBC GUID | 保留 UUID 类型语义 |
+| `common::Json` | PostgreSQL JSON/JSONB、MySQL JSON | 保留 JSON 文本，解析策略由业务决定 |
+
+这些包装类型都有公开的 `value` 字段，例如 `common::Decimal{"12.3400"}`；参数绑定、
+完整 SQL 诊断、查询缓存键和预编译类型签名都会区分这些类型。
 
 ## 预编译语句 / 生成键 / 大参数流式
 
@@ -462,7 +475,11 @@ cur->close();   // 显式归还连接；不调也会在析构时关 + 还
 执行中断线或超时存在“已提交但回包丢失”的歧义，中间件会直接返回错误，
 不会在另一个主库上盲目重放。全部候选在执行前就不可用时：
 
-- 若配了 `failover.write_buffer`，写请求进入有界内存队列，由后台 flush 线程在主恢复后补发，立即返回 `Buffered`（**软降级**：入队即返回，不代表已提交，进程崩溃会丢数据）；
+dbmw 不执行选主、租约或 fencing，因此自动写切换默认拒绝启用。只有数据库集群已通过
+外部机制保证单主时，才可设置 `acknowledge_external_fencing=true`。这个配置只是显式风险
+确认，不会凭空提供 fencing 能力。
+
+- 若配了 `failover.write_buffer`，写请求进入有界内存队列，由后台 flush 线程在主恢复后补发，立即返回 `Buffered`（**软降级**：不代表已提交；进程崩溃会丢数据，补发也可能重复）；该能力必须显式设置 `acknowledge_data_loss_and_duplicates=true`；
 - 否则返回 `CircuitOpen`（标记为可重试，由上层重试/熔断处理）。
 
 约束：**故障转移和写缓冲都不用于事务**——事务回调未必幂等，重放可能造成重复写入，因此主不可用时事务直接失败，由调用方决定补发。
@@ -476,9 +493,11 @@ cur->close();   // 显式归还连接；不调也会在析构时关 + 还
     "read_after_write_ms": 1000,
     "failover": {
       "primaries": ["main_standby"],
+      "acknowledge_external_fencing": true,
       "require_healthy": false,
       "write_buffer": {
         "enabled": false,
+        "acknowledge_data_loss_and_duplicates": false,
         "max_queue": 1000,
         "ttl_ms": 30000,
         "flush_interval_ms": 1000
@@ -573,7 +592,7 @@ cur->close();   // 显式归还连接；不调也会在析构时关 + 还
 实现（`src/core/query_cache.cpp`）：全局单例，`std::unordered_map<std::string, Entry> store_` + `std::list<std::string> lru_`（最近使用在表头），一把 `std::mutex mtx_`。开关 `enabled_` / `replicaOnly_` 用 `std::atomic` 镜像——**热路径先无锁读原子标志，缓存关着时连 mtx_ 都不抢**。命中率/淘汰/失效计数均为原子量，`QueryCache::stats()` 暴露，热加载清空缓存不清计数（进程累计量）。
 
 **KV 内容：**
-- **key** = `数据源名 + '\0' + cacheKey(sql, params)`，其中 `cacheKey` = 原始 SQL + `\x1e` + 参数个数 + 每参数（`\x1f` + 类型标记 + 长度前缀值）。逐类型打标记（`n`/`b`/`i`/`d`/`t`/`s`/`x`）：double 按位序列化（十进制会丢精度）、string/blob 加长度前缀，**确保不同参数必得不同 key**。这里用的是参数**值**，不是结构模板——模板会把字面量折成 `?` 导致不同取值撞同一 key。
+- **key** = `数据源名 + '\0' + cacheKey(sql, params)`，其中 `cacheKey` = 原始 SQL + `\x1e` + 参数个数 + 每参数（`\x1f` + 类型标记 + 长度前缀值）。NULL、bool、int64、uint64、double、Decimal、string、Date、Time、Timestamp、UUID、JSON、Blob 都有独立标记；double 按位序列化，所有文本/二进制值加长度前缀，**确保不同类型或参数值得到不同 key**。
 - **value** = `Entry { ResultSet rs; expire; list::iterator lru; bytes; }`，存的是结果集**深拷贝** + TTL 时刻 + 近似字节数。
 
 **过期策略（三重）：**
@@ -587,7 +606,7 @@ cur->close();   // 显式归还连接；不调也会在析构时关 + 还
 
 三驱动（`MySQLConnection` / `PostgresConnection` / `OdbcConnection`）各自在 `prepare()` 内维护一份本连接的句柄缓存。门面 `Session::runPreparedQuery` / `runPreparedExec` 在 `preparedPathUsable()` 时调 `conn->prepare`，由驱动内部查"本连接"的缓存——这就是 `DataSource::query/execute(params)` 的**透明自动缓存**（用法见上文「预编译语句复用」）。要生成键时不走这条路径（见下文注意事项）。
 
-实现：每个连接对象持有 `std::unordered_map<std::string, PreparedStatementHandle> preparedCache_` + `std::list<std::string> preparedLru_` + 递增序号（生成句柄 id）+ `preparedLimit_`（每连接上限）。连接归还池后 map 保留、下次借到同一连接直接复用；连接关闭 `close()` → `closeAllPrepared()` 释放全部原生句柄。
+实现：每个连接对象持有 SQL→句柄缓存、LRU 链表和句柄 ID→缓存键索引。后者用于 O(1) 验证显式句柄仍属于当前连接且未被淘汰。连接归还池后缓存保留、下次借到同一连接直接复用；连接关闭 `close()` → `closeAllPrepared()` 释放全部原生句柄并清空索引。
 
 **KV 内容：**
 - **key** = `sql + common::paramTypeSignature(typesSample)`，用**参数类型签名**而非参数值——同 SQL 不同参数类型在 prepare 阶段必须视为不同语句。
@@ -599,7 +618,8 @@ cur->close();   // 显式归还连接；不调也会在析构时关 + 还
 
 **为什么**：热点语句 prepare-once / execute-many，省服务端硬解析 + 参数类型推导往返；**不改变任何查询结果**，纯性能优化，故**默认开**。
 
-> 注意：被 LRU 淘汰的句柄若仍被上层持有会悬空——这是 LRU 固有取舍，默认不限制则不触发，显式设上限即表示接受。
+> 显式句柄被 LRU 淘汰后，再执行会稳定返回 `QueryError`；驱动会先按句柄 ID
+> 验证其仍属于当前连接缓存，不会解引用已经释放的原生句柄。
 
 ### 3. 慢 SQL 聚合统计缓存（Observer LRU，非业务数据）
 
@@ -880,7 +900,7 @@ g++ main.cpp $(pkg-config --cflags --libs dbmw) -o my_app
 | `datasources[].max_result_rows` | `query()` 单次物化的最大行数；超限返回错误并提示改用 `queryEach()`（0 = 不限制） |
 | `datasources[].tls` | TLS 开关、证书校验、CA/客户端证书与私钥 |
 | `datasources[].extra` | 驱动自定义扩展参数 |
-| `groups[]` | 主库、副本权重、写后读窗口、主库回退、只读标志（`read_only`）与故障转移（`failover.primaries` / `require_healthy` / `write_buffer`） |
+| `groups[]` | 主库、副本权重、写后读窗口、主库回退、只读标志与故障转移；自动换主需 `acknowledge_external_fencing`，易失缓冲需 `acknowledge_data_loss_and_duplicates` |
 
 详见 `config/datasources.json.example`。
 

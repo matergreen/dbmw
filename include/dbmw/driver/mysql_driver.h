@@ -138,6 +138,7 @@ namespace dbmw::driver {
         // 原生 MYSQL_STMT* 存于 handle.native()（void*），连接归还池后缓存仍保留，
         // 随连接关闭（closeAllPrepared）释放。preparedLimit_>0 时按 LRU 淘汰。
         std::unordered_map<std::string, core::PreparedStatementHandle> preparedCache_;
+        std::unordered_map<std::uint64_t, std::string> preparedKeys_;
         std::list<std::string> preparedLru_;
         std::uint64_t preparedSeq_ = 0;
         int preparedLimit_ = 0;

@@ -152,6 +152,29 @@ namespace dbmw::core {
                 }
                 return escapeLiteral(limited);
             }
+            const auto renderTypedText = [&](const std::string &text,
+                                             const char *type) -> std::string {
+                if (!options.includeStringValues)
+                    return std::string("'<redacted:") + type + ">'";
+                std::string limited = text;
+                if (limited.size() > options.maxParamLength) {
+                    limited.resize(options.maxParamLength);
+                    limited += "...[truncated]";
+                }
+                // 诊断渲染仍必须走驱动转义；强类型包装绝不能成为日志路径上的
+                // 原样 SQL 片段，否则恶意 Decimal/JSON 文本可伪造后续语句。
+                return escapeLiteral(common::Value{std::move(limited)});
+            };
+            if (const auto *x = std::get_if<common::Decimal>(&value))
+                return renderTypedText(x->value, "decimal");
+            if (const auto *x = std::get_if<common::Date>(&value))
+                return renderTypedText(x->value, "date");
+            if (const auto *x = std::get_if<common::Time>(&value))
+                return renderTypedText(x->value, "time");
+            if (const auto *x = std::get_if<common::Uuid>(&value))
+                return renderTypedText(x->value, "uuid");
+            if (const auto *x = std::get_if<common::Json>(&value))
+                return renderTypedText(x->value, "json");
             if (const auto *blob = std::get_if<common::Blob>(&value)) {
                 if (!options.includeBlobValues) {
                     return std::string("'<blob:") + std::to_string(blob->size()) + " bytes>'";

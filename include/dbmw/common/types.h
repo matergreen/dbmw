@@ -12,15 +12,38 @@
 
 
 namespace dbmw::common {
-    // 时间点：对应 SQL 的 TIMESTAMP / DATETIME / DATE。
+    // 时间点：对应 SQL 的 TIMESTAMP / DATETIME；纯 DATE/TIME 使用下方强类型。
     using Timestamp = std::chrono::system_clock::time_point;
 
     // 二进制大对象：对应 SQL 的 BLOB / BYTEA / VARBINARY。
     using Blob = std::vector<std::uint8_t>;
 
+    // 必须保留原始文本的数据库类型。使用强类型包装而不是普通 string，既避免
+    // DECIMAL 转 double 丢精度，也让缓存键、预编译签名和调用方类型判断不混淆。
+    struct Decimal {
+        std::string value;
+        bool operator==(const Decimal &other) const { return value == other.value; }
+    };
+    struct Date {
+        std::string value; // ISO 日期，通常为 YYYY-MM-DD；异常驱动文本也原样保留
+        bool operator==(const Date &other) const { return value == other.value; }
+    };
+    struct Time {
+        std::string value; // HH:MM:SS[.fraction][timezone]
+        bool operator==(const Time &other) const { return value == other.value; }
+    };
+    struct Uuid {
+        std::string value;
+        bool operator==(const Uuid &other) const { return value == other.value; }
+    };
+    struct Json {
+        std::string value;
+        bool operator==(const Json &other) const { return value == other.value; }
+    };
+
     // 字段值：支持常见 SQL 列类型；nullptr_t 表示 SQL NULL。
-    using Value = std::variant<std::nullptr_t, bool, std::int64_t, double,
-                               std::string, Timestamp, Blob>;
+    using Value = std::variant<std::nullptr_t, bool, std::int64_t, std::uint64_t, double,
+                               Decimal, std::string, Date, Time, Timestamp, Uuid, Json, Blob>;
 
     // 一行数据：列名 -> 值。
     //
@@ -277,7 +300,7 @@ namespace dbmw::common {
     //
     // 用作预编译语句缓存 key 的一部分——PG / MySQL 在 prepare 阶段就需要参数类型，
     // 类型序列不同、文本相同的两条 SQL 必须视为两条不同的预备语句。
-    // 每个参数一个字符：n=NULL, b=bool, i=int64, d=double, s=string, t=Timestamp, x=Blob。
+    // 每个参数一个字符，具体标记由实现稳定维护。
     std::string paramTypeSignature(const Params &params);
 } // namespace dbmw::common
 

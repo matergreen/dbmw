@@ -32,6 +32,11 @@ namespace dbmw::core {
 
         std::size_t valueBytes(const common::Value &v) {
             if (const auto *p = std::get_if<std::string>(&v)) return p->size();
+            if (const auto *p = std::get_if<common::Decimal>(&v)) return p->value.size();
+            if (const auto *p = std::get_if<common::Date>(&v)) return p->value.size();
+            if (const auto *p = std::get_if<common::Time>(&v)) return p->value.size();
+            if (const auto *p = std::get_if<common::Uuid>(&v)) return p->value.size();
+            if (const auto *p = std::get_if<common::Json>(&v)) return p->value.size();
             if (const auto *p = std::get_if<common::Blob>(&v)) return p->size();
             return sizeof(common::Value);
         }

@@ -147,9 +147,11 @@
       "read_only": false,
       "failover": {
         "primaries": ["main_standby"],
+        "acknowledge_external_fencing": true,
         "require_healthy": false,
         "write_buffer": {
           "enabled": false,
+          "acknowledge_data_loss_and_duplicates": false,
           "max_queue": 1000,
           "ttl_ms": 30000,
           "flush_interval_ms": 1000

@@ -131,13 +131,14 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-真实 PostgreSQL 集成测试需要同时启用 PostgreSQL 驱动和集成测试，并通过
-`DBMW_TEST_PG_HOST`、`DBMW_TEST_PG_PORT`、`DBMW_TEST_PG_USER`、
-`DBMW_TEST_PG_PASSWORD`、`DBMW_TEST_PG_DATABASE` 提供连接信息：
+真实数据库集成测试支持 PostgreSQL、MySQL 和 SQL Server（ODBC）。分别通过
+`DBMW_TEST_PG_*`、`DBMW_TEST_MYSQL_*`、`DBMW_TEST_ODBC_*` 环境变量提供连接信息：
 
 ```bash
 cmake -S . -B build \
   -DDBMW_ENABLE_POSTGRES=ON \
+  -DDBMW_ENABLE_MYSQL=ON \
+  -DDBMW_ENABLE_ODBC=ON \
   -DDBMW_BUILD_TESTS=ON \
   -DDBMW_BUILD_INTEGRATION_TESTS=ON
 cmake --build build -j

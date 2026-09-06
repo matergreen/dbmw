@@ -136,13 +136,15 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The live PostgreSQL integration test also requires the PostgreSQL driver and integration-test
-target. Provide connection details through `DBMW_TEST_PG_HOST`, `DBMW_TEST_PG_PORT`,
-`DBMW_TEST_PG_USER`, `DBMW_TEST_PG_PASSWORD`, and `DBMW_TEST_PG_DATABASE`:
+Live integration tests support PostgreSQL, MySQL, and SQL Server (ODBC). Provide connection
+details through the `DBMW_TEST_PG_*`, `DBMW_TEST_MYSQL_*`, and `DBMW_TEST_ODBC_*`
+environment variables:
 
 ```bash
 cmake -S . -B build \
   -DDBMW_ENABLE_POSTGRES=ON \
+  -DDBMW_ENABLE_MYSQL=ON \
+  -DDBMW_ENABLE_ODBC=ON \
   -DDBMW_BUILD_TESTS=ON \
   -DDBMW_BUILD_INTEGRATION_TESTS=ON
 cmake --build build -j

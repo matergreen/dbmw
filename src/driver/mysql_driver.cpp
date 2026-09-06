@@ -88,6 +88,7 @@ namespace dbmw::driver {
             std::vector<std::vector<char> > strBuf;
             MysqlBoolArray isNull;
             std::vector<long long> intBuf;
+            std::vector<unsigned long long> uintBuf;
             std::vector<double> dblBuf;
             std::vector<unsigned long> len;
         };
@@ -102,9 +103,10 @@ namespace dbmw::driver {
         }
 
         // 将 MySQL 列类型转换为 dbmw 的通用 Value。
-        // 数值/小数尽量解析为 int64/double，日期时间解析为 Timestamp，
+        // 整数保留符号属性，DECIMAL 保留十进制文本，日期/时间保留独立语义，
         // 二进制列为 Blob，其余一律作为字符串，NULL 由调用方处理。
-        common::Value fieldToValue(enum_field_types type, const char *data, unsigned long len) {
+        common::Value fieldToValue(enum_field_types type, unsigned int flags,
+                                   const char *data, unsigned long len) {
             using common::Value;
             switch (type) {
                 case MYSQL_TYPE_TINY:
@@ -112,20 +114,31 @@ namespace dbmw::driver {
                 case MYSQL_TYPE_INT24:
                 case MYSQL_TYPE_LONG:
                 case MYSQL_TYPE_LONGLONG: {
+                    if ((flags & UNSIGNED_FLAG) != 0) {
+                        try { return Value{static_cast<std::uint64_t>(
+                            std::stoull(std::string(data, len)))}; } catch (...) {
+                            return Value{std::string(data, len)};
+                        }
+                    }
                     try { return Value{std::stoll(std::string(data, len))}; } catch (...) {
                         return Value{std::string(data, len)};
                     }
                 }
                 case MYSQL_TYPE_FLOAT:
-                case MYSQL_TYPE_DOUBLE:
-                case MYSQL_TYPE_DECIMAL:
-                case MYSQL_TYPE_NEWDECIMAL: {
+                case MYSQL_TYPE_DOUBLE: {
                     try { return Value{std::stod(std::string(data, len))}; } catch (...) {
                         return Value{std::string(data, len)};
                     }
                 }
+                case MYSQL_TYPE_DECIMAL:
+                case MYSQL_TYPE_NEWDECIMAL: {
+                    return Value{common::Decimal{std::string(data, len)}};
+                }
                 case MYSQL_TYPE_DATE:
                 case MYSQL_TYPE_NEWDATE:
+                    return Value{common::Date{std::string(data, len)}};
+                case MYSQL_TYPE_TIME:
+                    return Value{common::Time{std::string(data, len)}};
                 case MYSQL_TYPE_DATETIME:
                 case MYSQL_TYPE_TIMESTAMP: {
                     const std::string s(data, len);
@@ -133,6 +146,8 @@ namespace dbmw::driver {
                     if (common::tryParseTimestamp(s, ts)) return Value{ts};
                     return Value{s}; // 零日期等无法解析的值退化为字符串，不丢数据
                 }
+                case static_cast<enum_field_types>(245): // MYSQL_TYPE_JSON
+                    return Value{common::Json{std::string(data, len)}};
                 case MYSQL_TYPE_TINY_BLOB:
                 case MYSQL_TYPE_BLOB:
                 case MYSQL_TYPE_MEDIUM_BLOB:
@@ -295,7 +310,8 @@ namespace dbmw::driver {
                     r.set(colName, nullptr); // SQL NULL
                     continue;
                 }
-                r.set(colName, fieldToValue(fields[i].type, row[i], lengths[i]));
+                r.set(colName, fieldToValue(fields[i].type, fields[i].flags,
+                                            row[i], lengths[i]));
             }
             out.addRow(std::move(r));
         }
@@ -345,6 +361,7 @@ namespace dbmw::driver {
             st.strBuf.resize(n);
             st.isNull = std::make_unique<MysqlBool[]>(n);
             st.intBuf.assign(n, 0);
+            st.uintBuf.assign(n, 0);
             st.dblBuf.assign(n, 0.0);
             st.len.assign(n, 0);
 
@@ -365,6 +382,11 @@ namespace dbmw::driver {
                     b.buffer_type = MYSQL_TYPE_LONGLONG;
                     st.intBuf[i] = *x;
                     b.buffer = &st.intBuf[i];
+                } else if (const auto *x = std::get_if<std::uint64_t>(&v)) {
+                    b.buffer_type = MYSQL_TYPE_LONGLONG;
+                    b.is_unsigned = 1;
+                    st.uintBuf[i] = static_cast<unsigned long long>(*x);
+                    b.buffer = &st.uintBuf[i];
                 } else if (const auto *x = std::get_if<double>(&v)) {
                     b.buffer_type = MYSQL_TYPE_DOUBLE;
                     st.dblBuf[i] = *x;
@@ -373,6 +395,24 @@ namespace dbmw::driver {
                     b.buffer_type = MYSQL_TYPE_STRING;
                     const std::string s = common::timestampToStringMs(*x);
                     setStringParam(st, i, s.data(), s.size());
+                } else if (const auto *x = std::get_if<common::Decimal>(&v)) {
+                    // 这些强类型在 C API 边界以文本发送，由服务端目标列完成
+                    // 类型转换；MYSQL_TYPE_DATE/TIME 作为 C buffer_type 时要求
+                    // MYSQL_TIME 结构，不能指向字符串缓冲。
+                    b.buffer_type = MYSQL_TYPE_STRING;
+                    setStringParam(st, i, x->value.data(), x->value.size());
+                } else if (const auto *x = std::get_if<common::Date>(&v)) {
+                    b.buffer_type = MYSQL_TYPE_STRING;
+                    setStringParam(st, i, x->value.data(), x->value.size());
+                } else if (const auto *x = std::get_if<common::Time>(&v)) {
+                    b.buffer_type = MYSQL_TYPE_STRING;
+                    setStringParam(st, i, x->value.data(), x->value.size());
+                } else if (const auto *x = std::get_if<common::Uuid>(&v)) {
+                    b.buffer_type = MYSQL_TYPE_STRING;
+                    setStringParam(st, i, x->value.data(), x->value.size());
+                } else if (const auto *x = std::get_if<common::Json>(&v)) {
+                    b.buffer_type = MYSQL_TYPE_STRING;
+                    setStringParam(st, i, x->value.data(), x->value.size());
                 } else if (const auto *x = std::get_if<common::Blob>(&v)) {
                     b.buffer_type = MYSQL_TYPE_BLOB;
                     st.strBuf[i].resize(x->size());
@@ -487,7 +527,8 @@ namespace dbmw::driver {
                         r.set(colName, nullptr);
                         continue;
                     }
-                    r.set(colName, fieldToValue(fields[i].type, buf[i].data(), len[i]));
+                    r.set(colName, fieldToValue(fields[i].type, fields[i].flags,
+                                                buf[i].data(), len[i]));
                 }
                 if (out) {
                     // 边取边判：prepared 路径逐行 fetch，无法预知总行数，
@@ -534,10 +575,12 @@ namespace dbmw::driver {
             nfields_ = mysql_num_fields(meta_);
             fields_.reserve(nfields_);
             types_.reserve(nfields_);
+            flags_.reserve(nfields_);
             MYSQL_FIELD *f = mysql_fetch_fields(meta_);
             for (unsigned int i = 0; i < nfields_; ++i) {
                 fields_.emplace_back(f[i].name);
                 types_.push_back(f[i].type);
+                flags_.push_back(f[i].flags);
             }
             buf_.assign(nfields_, std::vector<char>(kInitialColBytes));
             len_.assign(nfields_, 0);
@@ -584,7 +627,8 @@ namespace dbmw::driver {
                 for (unsigned int c = 0; c < nfields_; ++c) {
                     const char *colName = fields_[c].c_str();
                     if (isNull_[c]) { row.set(colName, nullptr); continue; }
-                    row.set(colName, fieldToValue(types_[c], buf_[c].data(), len_[c]));
+                    row.set(colName, fieldToValue(types_[c], flags_[c],
+                                                  buf_[c].data(), len_[c]));
                 }
                 out.addRow(std::move(row));
                 ++rowsFetched_;
@@ -628,6 +672,7 @@ namespace dbmw::driver {
         unsigned int nfields_ = 0;
         std::vector<std::string> fields_;
         std::vector<enum_field_types> types_;
+        std::vector<unsigned int> flags_;
         std::vector<std::vector<char>> buf_;
         std::vector<unsigned long> len_;
         MysqlBoolArray isNull_;
@@ -762,6 +807,7 @@ namespace dbmw::driver {
         core::PreparedStatementHandle h =
             core::PreparedStatementHandle::make(id, static_cast<void *>(stmt));
         preparedCache_[key] = h;
+        preparedKeys_[id] = key;
         preparedLru_.push_back(key);
         // 超出每连接上限时按 LRU 淘汰（等价物 = mysql_stmt_close）。
         // 注意：被淘汰的句柄若仍被上层持有会悬空——这是 LRU 的固有取舍，
@@ -771,6 +817,7 @@ namespace dbmw::driver {
                 const std::string oldKey = preparedLru_.front();
                 preparedLru_.pop_front();
                 if (const auto oit = preparedCache_.find(oldKey); oit != preparedCache_.end()) {
+                    preparedKeys_.erase(oit->second.id());
                     if (MYSQL_STMT *s = static_cast<MYSQL_STMT *>(oit->second.native()))
                         mysql_stmt_close(s);
                     preparedCache_.erase(oit);
@@ -790,10 +837,14 @@ namespace dbmw::driver {
                                                    common::ResultSet &out) {
 #ifdef DBMW_ENABLE_MYSQL
         if (!open_ || !m_) return notConnected("executePrepared");
-        MYSQL_STMT *stmt = static_cast<MYSQL_STMT *>(h.native());
-        if (!stmt)
+        const auto key = preparedKeys_.find(h.id());
+        const auto cached = key == preparedKeys_.end()
+            ? preparedCache_.end() : preparedCache_.find(key->second);
+        MYSQL_STMT *stmt = cached == preparedCache_.end()
+            ? nullptr : static_cast<MYSQL_STMT *>(cached->second.native());
+        if (!h.valid() || !stmt)
             return common::Status::error(common::ErrorCode::QueryError,
-                                         "MySQL: invalid prepared handle (null statement)");
+                                         "MySQL: prepared handle is invalid or has been evicted");
         // 复用连接缓存里的语句句柄：只重新绑定本次参数并执行，不重新 prepare。
         ActiveMysqlOperation active(operationMtx_, activeThreadId_, mysql_thread_id(m_));
         ParamStorage st;
@@ -812,10 +863,14 @@ namespace dbmw::driver {
 #ifdef DBMW_ENABLE_MYSQL
         affected = 0;
         if (!open_ || !m_) return notConnected("executePrepared");
-        MYSQL_STMT *stmt = static_cast<MYSQL_STMT *>(h.native());
-        if (!stmt)
+        const auto key = preparedKeys_.find(h.id());
+        const auto cached = key == preparedKeys_.end()
+            ? preparedCache_.end() : preparedCache_.find(key->second);
+        MYSQL_STMT *stmt = cached == preparedCache_.end()
+            ? nullptr : static_cast<MYSQL_STMT *>(cached->second.native());
+        if (!h.valid() || !stmt)
             return common::Status::error(common::ErrorCode::QueryError,
-                                         "MySQL: invalid prepared handle (null statement)");
+                                         "MySQL: prepared handle is invalid or has been evicted");
         ActiveMysqlOperation active(operationMtx_, activeThreadId_, mysql_thread_id(m_));
         ParamStorage st;
         if (const auto s = bindParamsOnly(stmt, params, st); !s.ok()) return s;
@@ -835,6 +890,7 @@ namespace dbmw::driver {
                 mysql_stmt_close(s);
         }
         preparedCache_.clear();
+        preparedKeys_.clear();
         preparedLru_.clear();
 #endif
     }

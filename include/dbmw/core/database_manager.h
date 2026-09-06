@@ -83,6 +83,7 @@ namespace dbmw {
 
         Session &operator=(Session &&other) noexcept {
             if (this != &other) {
+                cleanupOpenTransaction();
                 h_ = std::move(other.h_);
                 dataSource_ = std::move(other.dataSource_);
                 audit_ = other.audit_;
@@ -233,6 +234,9 @@ namespace dbmw {
                                                      const common::Params &params,
                                                      std::int64_t &affected,
                                                      common::GeneratedKeys *keys) const;
+
+        // 析构与移动赋值共享：未结束事务必须先回滚；回滚失败则作废连接。
+        void cleanupOpenTransaction() noexcept;
 
         std::unique_ptr<ConnectionPool::Handle> h_;
         std::string dataSource_;

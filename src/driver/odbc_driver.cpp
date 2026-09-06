@@ -21,6 +21,14 @@ namespace dbmw::driver {
             return rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO;
         }
 
+        // SQL_NO_DATA is a valid completion for statements that do not produce a
+        // result set (FreeTDS returns it for DDL and zero-row DML).  Keep query
+        // paths strict: there SQL_NO_DATA before fetching is not interchangeable
+        // with a successfully opened result set.
+        bool executionCompleted(const SQLRETURN rc) {
+            return succeeded(rc) || rc == SQL_NO_DATA;
+        }
+
         bool validSavepointName(const std::string &name) {
             if (name.empty() || !(std::isalpha(static_cast<unsigned char>(name[0])) ||
                                   name[0] == '_')) return false;
@@ -187,6 +195,11 @@ namespace dbmw::driver {
 
         common::Value textValue(const SQLSMALLINT sqlType, std::string value) {
             try {
+                // SQL Server exposes TIME(n) as the vendor-specific SQL_SS_TIME2
+                // type (-154).  FreeTDS intentionally returns that numeric code
+                // without requiring Microsoft's sqlncli.h extension header.
+                if (sqlType == static_cast<SQLSMALLINT>(-154))
+                    return common::Value{common::Time{std::move(value)}};
                 switch (sqlType) {
                     case SQL_TINYINT:
                     case SQL_SMALLINT:
@@ -198,19 +211,26 @@ namespace dbmw::driver {
                     case SQL_REAL:
                     case SQL_FLOAT:
                     case SQL_DOUBLE:
+                        return common::Value{std::stod(value)};
                     case SQL_DECIMAL:
                     case SQL_NUMERIC:
-                        return common::Value{std::stod(value)};
+                        return common::Value{common::Decimal{std::move(value)}};
                     case SQL_TYPE_DATE:
-                    case SQL_TYPE_TIME:
-                    case SQL_TYPE_TIMESTAMP:
                     case SQL_DATE:
+                        return common::Value{common::Date{std::move(value)}};
+                    case SQL_TYPE_TIME:
                     case SQL_TIME:
+                        return common::Value{common::Time{std::move(value)}};
+                    case SQL_TYPE_TIMESTAMP:
                     case SQL_TIMESTAMP: {
                         common::Timestamp ts{};
                         if (common::tryParseTimestamp(value, ts)) return common::Value{ts};
                         return common::Value{std::move(value)};
                     }
+#ifdef SQL_GUID
+                    case SQL_GUID:
+                        return common::Value{common::Uuid{std::move(value)}};
+#endif
                     default:
                         return common::Value{std::move(value)};
                 }
@@ -342,6 +362,7 @@ namespace dbmw::driver {
         struct ParamBinding {
             SQLLEN indicator = 0;
             std::int64_t integer = 0;
+            std::uint64_t unsignedInteger = 0;
             double real = 0.0;
             std::string text;
             common::Blob blob;
@@ -356,6 +377,7 @@ namespace dbmw::driver {
                 SQLSMALLINT cType = SQL_C_CHAR;
                 SQLSMALLINT sqlType = SQL_VARCHAR;
                 SQLULEN columnSize = 1;
+                SQLSMALLINT decimalDigits = 0;
                 SQLPOINTER data = nullptr;
                 SQLLEN bufferLength = 0;
 
@@ -371,6 +393,11 @@ namespace dbmw::driver {
                     slot.indicator = 0;
                     cType = SQL_C_SBIGINT; sqlType = SQL_BIGINT;
                     data = &slot.integer; bufferLength = sizeof(slot.integer);
+                } else if (const auto *v = std::get_if<std::uint64_t>(&value)) {
+                    slot.unsignedInteger = *v;
+                    slot.indicator = 0;
+                    cType = SQL_C_UBIGINT; sqlType = SQL_BIGINT;
+                    data = &slot.unsignedInteger; bufferLength = sizeof(slot.unsignedInteger);
                 } else if (const auto *v = std::get_if<double>(&value)) {
                     slot.real = *v;
                     slot.indicator = 0;
@@ -380,6 +407,55 @@ namespace dbmw::driver {
                     slot.text = common::timestampToStringMs(*v);
                     slot.indicator = static_cast<SQLLEN>(slot.text.size());
                     columnSize = static_cast<SQLULEN>(slot.text.size());
+                    data = const_cast<char *>(slot.text.data());
+                    bufferLength = static_cast<SQLLEN>(slot.text.size());
+                } else if (const auto *v = std::get_if<common::Decimal>(&value)) {
+                    slot.text = v->value;
+                    slot.indicator = static_cast<SQLLEN>(slot.text.size());
+                    cType = SQL_C_CHAR; sqlType = SQL_DECIMAL;
+                    std::size_t precision = 0;
+                    bool fractional = false;
+                    for (const char ch : slot.text) {
+                        if (ch == 'e' || ch == 'E') break;
+                        if (ch == '.') {
+                            fractional = true;
+                        } else if (ch >= '0' && ch <= '9') {
+                            ++precision;
+                            if (fractional && decimalDigits < 32767) ++decimalDigits;
+                        }
+                    }
+                    columnSize = static_cast<SQLULEN>(std::max<std::size_t>(1, precision));
+                    data = const_cast<char *>(slot.text.data());
+                    bufferLength = static_cast<SQLLEN>(slot.text.size());
+                } else if (const auto *v = std::get_if<common::Date>(&value)) {
+                    slot.text = v->value;
+                    slot.indicator = static_cast<SQLLEN>(slot.text.size());
+                    cType = SQL_C_CHAR; sqlType = SQL_TYPE_DATE;
+                    columnSize = static_cast<SQLULEN>(slot.text.size());
+                    data = const_cast<char *>(slot.text.data());
+                    bufferLength = static_cast<SQLLEN>(slot.text.size());
+                } else if (const auto *v = std::get_if<common::Time>(&value)) {
+                    slot.text = v->value;
+                    slot.indicator = static_cast<SQLLEN>(slot.text.size());
+                    cType = SQL_C_CHAR; sqlType = SQL_TYPE_TIME;
+                    columnSize = static_cast<SQLULEN>(slot.text.size());
+                    data = const_cast<char *>(slot.text.data());
+                    bufferLength = static_cast<SQLLEN>(slot.text.size());
+                } else if (const auto *v = std::get_if<common::Uuid>(&value)) {
+                    slot.text = v->value;
+                    slot.indicator = static_cast<SQLLEN>(slot.text.size());
+                    cType = SQL_C_CHAR;
+#ifdef SQL_GUID
+                    sqlType = SQL_GUID;
+#endif
+                    columnSize = static_cast<SQLULEN>(slot.text.size());
+                    data = const_cast<char *>(slot.text.data());
+                    bufferLength = static_cast<SQLLEN>(slot.text.size());
+                } else if (const auto *v = std::get_if<common::Json>(&value)) {
+                    slot.text = v->value;
+                    slot.indicator = static_cast<SQLLEN>(slot.text.size());
+                    cType = SQL_C_CHAR; sqlType = SQL_LONGVARCHAR;
+                    columnSize = static_cast<SQLULEN>(std::max<std::size_t>(1, slot.text.size()));
                     data = const_cast<char *>(slot.text.data());
                     bufferLength = static_cast<SQLLEN>(slot.text.size());
                 } else if (const auto *v = std::get_if<common::Blob>(&value)) {
@@ -399,7 +475,8 @@ namespace dbmw::driver {
 
                 const SQLRETURN rc = SQLBindParameter(
                     stmt, static_cast<SQLUSMALLINT>(i + 1), SQL_PARAM_INPUT,
-                    cType, sqlType, columnSize, 0, data, bufferLength, &slot.indicator);
+                    cType, sqlType, columnSize, decimalDigits,
+                    data, bufferLength, &slot.indicator);
                 if (!succeeded(rc))
                     return odbcError(common::ErrorCode::QueryError, SQL_HANDLE_STMT,
                                      stmt, "SQLBindParameter");
@@ -661,7 +738,7 @@ namespace dbmw::driver {
         ActiveStatement active(activeStmtMtx_, activeStmt_, raw);
         if (const SQLRETURN rc = SQLExecDirect(
                 stmt.get(), reinterpret_cast<SQLCHAR *>(const_cast<char *>(sql.c_str())), SQL_NTS);
-            !succeeded(rc))
+            !executionCompleted(rc))
             return odbcError(common::ErrorCode::QueryError, SQL_HANDLE_STMT,
                              stmt.get(), "SQLExecDirect(execute)");
         SQLLEN rows = 0;
@@ -712,7 +789,7 @@ namespace dbmw::driver {
         StmtGuard stmt(raw);
         if (!status.ok()) return status;
         ActiveStatement active(activeStmtMtx_, activeStmt_, raw);
-        if (const SQLRETURN rc = SQLExecute(raw); !succeeded(rc))
+        if (const SQLRETURN rc = SQLExecute(raw); !executionCompleted(rc))
             return odbcError(common::ErrorCode::QueryError, SQL_HANDLE_STMT, raw,
                              "SQLExecute");
         SQLLEN rows = 0;
@@ -1002,7 +1079,7 @@ namespace dbmw::driver {
         ActiveStatement active(activeStmtMtx_, activeStmt_, raw);
         if (const SQLRETURN rc = SQLExecDirect(
                 raw, reinterpret_cast<SQLCHAR *>(const_cast<char *>(sql.c_str())), SQL_NTS);
-            !succeeded(rc))
+            !executionCompleted(rc))
             return odbcError(common::ErrorCode::QueryError, SQL_HANDLE_STMT, raw,
                              "SQLExecDirect(execute/keys)");
         SQLLEN rows = 0;
@@ -1033,7 +1110,7 @@ namespace dbmw::driver {
         StmtGuard stmt(raw);
         if (!status.ok()) return status;
         ActiveStatement active(activeStmtMtx_, activeStmt_, raw);
-        if (const SQLRETURN rc = SQLExecute(raw); !succeeded(rc))
+        if (const SQLRETURN rc = SQLExecute(raw); !executionCompleted(rc))
             return odbcError(common::ErrorCode::QueryError, SQL_HANDLE_STMT, raw,
                              "SQLExecute(keys)");
         SQLLEN rows = 0;
@@ -1087,6 +1164,7 @@ namespace dbmw::driver {
         core::PreparedStatementHandle h =
             core::PreparedStatementHandle::make(id, reinterpret_cast<void *>(raw));
         preparedCache_[key] = h;
+        preparedKeys_[id] = key;
         preparedLru_.push_back(key);
         // 超出每连接上限时按 LRU 淘汰（SQLFreeHandle 释放 SQLHSTMT）。
         if (preparedLimit_ > 0) {
@@ -1094,6 +1172,7 @@ namespace dbmw::driver {
                 const std::string oldKey = preparedLru_.front();
                 preparedLru_.pop_front();
                 if (const auto oit = preparedCache_.find(oldKey); oit != preparedCache_.end()) {
+                    preparedKeys_.erase(oit->second.id());
                     SQLHSTMT old = reinterpret_cast<SQLHSTMT>(oit->second.native());
                     if (old != SQL_NULL_HSTMT) SQLFreeHandle(SQL_HANDLE_STMT, old);
                     preparedCache_.erase(oit);
@@ -1115,10 +1194,13 @@ namespace dbmw::driver {
         out.clear();
         if (!open_) return common::Status::error(common::ErrorCode::NotConnected,
                                                  "ODBC: not connected (executePrepared)");
-        if (!h.valid() || h.native() == nullptr)
+        const auto key = preparedKeys_.find(h.id());
+        const auto cached = key == preparedKeys_.end()
+            ? preparedCache_.end() : preparedCache_.find(key->second);
+        if (!h.valid() || cached == preparedCache_.end() || cached->second.native() == nullptr)
             return common::Status::error(common::ErrorCode::QueryError,
-                                         "ODBC: invalid prepared handle");
-        SQLHSTMT stmt = reinterpret_cast<SQLHSTMT>(h.native());
+                                         "ODBC: prepared handle is invalid or has been evicted");
+        SQLHSTMT stmt = reinterpret_cast<SQLHSTMT>(cached->second.native());
         std::vector<ParamBinding> storage;
         if (const auto status = bindParameters(stmt, params, storage); !status.ok()) return status;
         ActiveStatement active(activeStmtMtx_, activeStmt_, reinterpret_cast<void *>(stmt));
@@ -1139,14 +1221,17 @@ namespace dbmw::driver {
         affected = 0;
         if (!open_) return common::Status::error(common::ErrorCode::NotConnected,
                                                  "ODBC: not connected (executePrepared)");
-        if (!h.valid() || h.native() == nullptr)
+        const auto key = preparedKeys_.find(h.id());
+        const auto cached = key == preparedKeys_.end()
+            ? preparedCache_.end() : preparedCache_.find(key->second);
+        if (!h.valid() || cached == preparedCache_.end() || cached->second.native() == nullptr)
             return common::Status::error(common::ErrorCode::QueryError,
-                                         "ODBC: invalid prepared handle");
-        SQLHSTMT stmt = reinterpret_cast<SQLHSTMT>(h.native());
+                                         "ODBC: prepared handle is invalid or has been evicted");
+        SQLHSTMT stmt = reinterpret_cast<SQLHSTMT>(cached->second.native());
         std::vector<ParamBinding> storage;
         if (const auto status = bindParameters(stmt, params, storage); !status.ok()) return status;
         ActiveStatement active(activeStmtMtx_, activeStmt_, reinterpret_cast<void *>(stmt));
-        if (const SQLRETURN rc = SQLExecute(stmt); !succeeded(rc))
+        if (const SQLRETURN rc = SQLExecute(stmt); !executionCompleted(rc))
             return odbcError(common::ErrorCode::QueryError, SQL_HANDLE_STMT, stmt,
                              "SQLExecute(prepared)");
         SQLLEN rows = 0;
@@ -1167,6 +1252,7 @@ namespace dbmw::driver {
             if (stmt != SQL_NULL_HSTMT) SQLFreeHandle(SQL_HANDLE_STMT, stmt);
         }
         preparedCache_.clear();
+        preparedKeys_.clear();
         preparedLru_.clear();
 #endif
     }

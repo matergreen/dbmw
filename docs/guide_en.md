@@ -14,7 +14,7 @@ A database connection middleware written in C++17, supporting:
 - **Parameterized queries**: `?` placeholders + bound parameters, eliminating the injection risk of SQL string concatenation.
 - **Prepared statements / generated keys / large-parameter streaming**: connection-level prepared-statement handle cache (hot SQL prepared only once, transparently), `execute` returns the auto-increment key (`GeneratedKeys`), and large-BLOB streaming writes (`StreamSource`). See the "Prepared statements / generated keys / large-parameter streaming" section below.
 - **Resilience & routing**: safe retry for read-only queries, exponential backoff, circuit breaker (open/half-open), primary/replica read-write routing, and read-after-write window.
-- **Primary failover**: the write path switches in order to candidate standbys when the primary is unavailable; when all fail, an optional write buffer provides soft degradation (background replay, returns `Buffered`) — but never for transactions.
+- **Primary failover**: candidates are used only after explicitly acknowledging that an external system provides single-leader fencing; the volatile write buffer separately requires acknowledgement of loss/duplicate risk and is never used for transactions.
 - **Rate limiting & backpressure**: a token-bucket cap on per-source total QPS and (optionally) per-SQL-fingerprint QPS; over the limit fails fast with `RateLimited` — no retry, no flooding the pool.
 - **SQL auditing & interception**: lightweight static analysis of SQL before execution; can block WHERE-less UPDATE/DELETE, LIMIT-less SELECT, writes on read-only sources, and block/allow by fingerprint blacklist/whitelist; a `warn` action provides a canary phase.
 - **Query result cache**: caches non-transactional, non-session reads keyed by `(data source + raw SQL + type-tagged params)` — LRU + TTL + memory cap, invalidated per source on write; off by default.
@@ -27,7 +27,7 @@ A database connection middleware written in C++17, supporting:
 - **Multiple database types**: built-in **MySQL / PostgreSQL / ODBC (SQL Server · Oracle)** drivers, plus a **driver extension interface** — adding a database only requires implementing `IDriver` and registering it.
 
 > Status: the core layer (config / pool / heartbeat / transaction / parameter binding / facade) is fully implemented
-> and validated by 137 behavioral tests in `tests/dbmw_core_test.cpp` (mock driver, no real database needed).
+> and validated by 146 behavioral tests in `tests/dbmw_core_test.cpp` (mock driver, no real database needed).
 >
 > Driver implementation progress:
 > - **MySQL — fully implemented** (libmysqlclient): connection timeout / charset, ping, column-type-aware result mapping,
@@ -186,6 +186,19 @@ auto st = dbmw::DBMW::query("SELECT * FROM t WHERE name = ? AND age > ?", p, rs)
 - A custom driver that has not implemented native binding returns `NotSupported` by default, never silently degrading to SQL concatenation.
 - Literal interpolation is enabled only for compatible drivers that explicitly override `allowsLiteralInterpolation()`; the scanner skips `?` inside strings, identifiers, and comments.
 - A placeholder count that does not match the parameter count returns `QueryError`, never silently producing wrong SQL.
+
+Database-specific values retain their semantics instead of collapsing into `string` or `double`:
+
+| C++ type | Database type | Semantics |
+|---|---|---|
+| `std::uint64_t` | MySQL unsigned integer | Covers `BIGINT UNSIGNED`; PostgreSQL sends it as decimal text |
+| `common::Decimal` | DECIMAL / NUMERIC | Preserves exact decimal text without a `double` round trip |
+| `common::Date` / `common::Time` | DATE / TIME | Kept separate from the point-in-time `Timestamp` type |
+| `common::Uuid` | PostgreSQL UUID / ODBC GUID | Retains UUID type identity |
+| `common::Json` | PostgreSQL JSON/JSONB, MySQL JSON | Preserves JSON text; parsing remains an application choice |
+
+Each wrapper exposes a public `value` member, for example `common::Decimal{"12.3400"}`.
+Binding, full-SQL diagnostics, cache keys, and prepared signatures distinguish these types.
 
 ## Prepared statements / generated keys / large-parameter streaming
 
@@ -417,7 +430,9 @@ These four capabilities are all **off by default, toggled as a whole**, and pass
 
 Group config `failover.primaries` gives an ordered list of writable candidates (primary auto-pinned to top). The write path picks an **un-open-circuited** candidate in order; when none is available:
 
-- If `failover.write_buffer` is configured, the write enters a bounded in-memory queue and is replayed by a background flush thread after the primary recovers, immediately returning `Buffered` (**soft degradation**: enqueued means returned, not committed; a process crash loses the data);
+dbmw does not perform leader election, leases, or fencing, so automatic write failover is rejected by default. Set `acknowledge_external_fencing=true` only when an external cluster mechanism already guarantees a single writable leader. This flag is an explicit risk acknowledgement; it does not implement fencing.
+
+- If `failover.write_buffer` is configured, the write enters a bounded in-memory queue and is replayed by a background flush thread after the primary recovers, immediately returning `Buffered` (**soft degradation**: accepted is not committed; a crash can lose writes and replay can duplicate them). Enabling it requires `acknowledge_data_loss_and_duplicates=true`;
 - Otherwise it returns `CircuitOpen` (marked retryable, to be handled by the upper layer's retry/circuit-breaker).
 
 Constraint: **neither failover nor the write buffer is used for transactions** — a transaction callback may not be idempotent, and replay could cause duplicate writes, so when the primary is unavailable a transaction simply fails and the caller decides on replay. The write path switches nodes only on connection-class / open-circuit failures; a business failure (e.g. unique-key conflict) returns directly without switching.
@@ -431,9 +446,11 @@ Constraint: **neither failover nor the write buffer is used for transactions** �
     "read_after_write_ms": 1000,
     "failover": {
       "primaries": ["main_standby"],
+      "acknowledge_external_fencing": true,
       "require_healthy": false,
       "write_buffer": {
         "enabled": false,
+        "acknowledge_data_loss_and_duplicates": false,
         "max_queue": 1000,
         "ttl_ms": 30000,
         "flush_interval_ms": 1000
@@ -528,7 +545,7 @@ Applies only to the leaf read path of `DataSource::query` (non-transactional, no
 Implementation (`src/core/query_cache.cpp`): a global singleton with `std::unordered_map<std::string, Entry> store_` + `std::list<std::string> lru_` (most-recently-used at the head), guarded by a single `std::mutex mtx_`. The `enabled_` / `replicaOnly_` flags are mirrored in `std::atomic`s — **the hot path reads the atomic flags lock-free, and never touches mtx_ when the cache is off**. Hit/eviction/invalidation counters are atomics exposed via `QueryCache::stats()`; clearing the cache on hot reload does not reset these (they are process-cumulative).
 
 **KV contents:**
-- **key** = `data-source name + '\0' + cacheKey(sql, params)`, where `cacheKey` = raw SQL + `\x1e` + param count + per-param (`\x1f` + type tag + length-prefixed value). Each type is tagged (`n`/`b`/`i`/`d`/`t`/`s`/`x`): doubles are serialized bitwise (decimal text loses precision), strings/blobs carry a length prefix, **so distinct parameters always produce distinct keys**. The key uses parameter **values**, not a structural template — a template folds literals into `?` and makes different values collide.
+- **key** = `data-source name + '\0' + cacheKey(sql, params)`, where `cacheKey` = raw SQL + `\x1e` + param count + per-param (`\x1f` + type tag + length-prefixed value). NULL, bool, int64, uint64, double, Decimal, string, Date, Time, Timestamp, UUID, JSON, and Blob each have a distinct tag; doubles are serialized bitwise and text/binary values carry length prefixes, **so different types or values cannot collide**.
 - **value** = `Entry { ResultSet rs; expire; list::iterator lru; bytes; }`: a **deep copy** of the result set + its TTL timestamp + an approximate byte size.
 
 **Expiry policy (three-fold):**
@@ -542,7 +559,7 @@ Implementation (`src/core/query_cache.cpp`): a global singleton with `std::unord
 
 All three drivers (`MySQLConnection` / `PostgresConnection` / `OdbcConnection`) maintain their own per-connection handle cache inside `prepare()`. The facade's `Session::runPreparedQuery` / `runPreparedExec`, when `preparedPathUsable()`, calls `conn->prepare`, which looks up the "current connection" cache internally — that is the **transparent auto-cache** behind `DataSource::query/execute(params)` (usage in the section "Prepared statements" above). The generated-keys path does NOT use this (see caveats below).
 
-Implementation: each connection object holds `std::unordered_map<std::string, PreparedStatementHandle> preparedCache_` + `std::list<std::string> preparedLru_` + a monotonic sequence (handle id) + `preparedLimit_` (per-connection cap). After a connection is returned to the pool the map persists and is reused next time the same connection is borrowed; on `close()` → `closeAllPrepared()` all native handles are released.
+Implementation: each connection keeps an SQL-to-handle cache, an LRU list, and a handle-ID-to-cache-key index. The latter validates in O(1) that an explicit handle still belongs to this connection and has not been evicted. The cache survives a return to the pool; `close()` → `closeAllPrepared()` releases native handles and clears every index.
 
 **KV contents:**
 - **key** = `sql + common::paramTypeSignature(typesSample)`, using the **parameter type signature**, not values — the same SQL with different parameter types must be treated as a different statement at prepare time.
@@ -554,7 +571,7 @@ Implementation: each connection object holds `std::unordered_map<std::string, Pr
 
 **Why**: prepare-once / execute-many for hot statements, saving the server-side hard-parse + type-inference round-trip; it **changes no query result** and is a pure performance optimization, so it is **on by default**.
 
-> Note: a handle evicted by LRU while still held by the upper layer becomes dangling — an inherent LRU trade-off; it does not trigger when unlimited (the default), and setting an explicit cap means accepting it.
+> After an explicit handle is evicted by LRU, executing it returns `QueryError` deterministically. Drivers validate the handle ID against the current connection cache before touching any native handle, so released native pointers are never dereferenced.
 
 ### 3. Slow-SQL aggregation cache (Observer LRU, non-business data)
 
@@ -820,7 +837,7 @@ Two easy-to-trip contracts:
 | `datasources[].max_result_rows` | Max rows `query()` may materialize at once; over the limit errors and suggests `queryEach()` (0 = unlimited) |
 | `datasources[].tls` | TLS toggle, cert verification, CA / client cert & key |
 | `datasources[].extra` | Driver-specific extension parameters |
-| `groups[]` | Primary, replica weights, read-after-write window, primary fallback, read-only flag (`read_only`) and failover (`failover.primaries` / `require_healthy` / `write_buffer`) |
+| `groups[]` | Primary, replica weights, read-after-write window, fallback and failover; automatic promotion requires `acknowledge_external_fencing`, and volatile buffering requires `acknowledge_data_loss_and_duplicates` |
 
 See `config/datasources.json.example` for details.
 
