@@ -416,14 +416,20 @@ int main() {
 
         // --- Queued：worker 被慢语句占满，后续操作排队中被取消 ---
         AsyncMockConnection::resetLog();
+        AsyncMockConnection::queryEntered = false;
         AsyncMockConnection::queryDelayMs = 300;
         std::promise<async::QueryResult> pr1, pr2;
         auto fut1 = pr1.get_future();
         auto fut2 = pr2.get_future();
-        const auto connectsBefore = AsyncMockConnection::connectCalls.load();
         auto h1 = async::query("SELECT busy", [&](async::QueryResult &&r) {
             pr1.set_value(std::move(r));
         });
+        // 先确认占位任务已经借到连接并进入驱动，再为排队任务记录基线。
+        // 否则慢 runner 上 h1 可能在基线之后才建连，测试会把 h1 的连接
+        // 错算成被取消的 h2 创建的连接（macOS CI 曾触发此竞态）。
+        check(waitUntil([&] { return AsyncMockConnection::queryEntered.load(); }, 2000),
+              "占位任务已进入驱动，连接创建基线稳定");
+        const auto connectsBefore = AsyncMockConnection::connectCalls.load();
         auto h2 = async::query("SELECT queued", [&](async::QueryResult &&r) {
             pr2.set_value(std::move(r));
         });
