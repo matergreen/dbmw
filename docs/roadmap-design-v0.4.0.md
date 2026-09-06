@@ -132,9 +132,10 @@
 | M5 | 幂等声明 | ✅ **已落地**（2026-09）——`context.h` 三态枚举 + 同步 `resolveWriteAttempts` + 异步 `maxAttempts` 接入 + 19 项单测。独立小改动，把重试语义从"引擎猜"变成"调用方声明" |
 | M6 | 影子库路由 | ✅ **已落地**（2026-09）——`DataSourceGroupConfig::shadow` 字段 + 同步 `readTarget/writeTargets/dispatchWrite/cacheEligible` 影子分支 + 异步 `entryCtx` 透传 + `resolveShadows` 4 项校验 + 39 项单测。复用 M1 SPI `onRoute` 触发，硬守住 I12（影子不进写缓冲）/ I10（影子不进缓存）；同步异步决策同源 |
 | M7 | 结果脱敏 | ✅ **已落地**（2026-09）——`ResultSet::transformed` 字段 + I10 守卫（cacheStore 内 `rows.transformed` 守卫 + queryUngated inline 守卫双层）+ 异步缓存命中路径补 afterExecution 修复 §9.4 风险行 + 38 项单测。完全依赖 SPI，零业务假设；改写规则由业务 MaskingInterceptor 提供 |
-| M8 | 读后写增强 | ✅ **已落地**（2026-09）——`SqlContext.wroteInThisRequest` 会话级粘性读 + `pinRequestWrite()` 在 leaf 写成功后置位栈顶 + `readTarget` 第 1 级判定 + `ConfigLoader` 副本+零窗口 WARN。3 级优先级：wIRT > 时间戳窗口 > 副本轮询；26 项单测覆盖同步 / 异步 / 帧隔离 / 影子 / 幂等正交
+| M8 | 读后写增强 | ✅ **已落地**（2026-09）——`SqlContext.wroteInThisRequest` 会话级粘性读 + `pinRequestWrite()` 在 leaf 写成功后置位栈顶 + `readTarget` 第 1 级判定 + `ConfigLoader` 副本+零窗口 WARN。3 级优先级：wIRT > 时间戳窗口 > 副本轮询；26 项单测覆盖同步 / 异步 / 帧隔离 / 影子 / 幂等正交 |
+| M9 | 观测延展（M6/M7 收尾）| ✅ **已落地**（2026-09）——`OperationEvent` 增加 `shadow` / `transformed` 两字段；emitSql 读栈顶 `SqlContext.shadow`，observeSql 透传 `ResultSet*` 读 `result->transformed`，同步异步共用 emitSql 一份注入路径；22 项单测 + 全库 543 项 0 失败。设计 §8.5 提到的"指标可观测性"补齐 |
 
-> 原 M9「轻量分片」已随 §11 的永久排除决策移除。当前路线共 **8 项**（M1–M8）。
+> 原「轻量分片」已随 §11 的永久排除决策移除；当前新增的 M9 仅做观测层延展，不引入分片。当前路线共 **9 项**（M1–M9）。
 
 ### §2.3 里程碑切分建议
 
@@ -144,6 +145,7 @@
 | **B** | M3 + M4 + M5 | 池指标可导出；运行时增删数据源可用；幂等声明影响重试 |
 | **C** | M6 + M7 | 影子流量隔离已通过（I12 单测覆盖）；脱敏结果确认不进缓存（I10 单测覆盖，§9.4 缓存命中修复已验证）|
 | **D** | M8 | 会话级读后写已落地（26 项单测）；副本 + 零窗口 WARN 已生效（stderr 验证通过）|
+| **D+** | M9 | 观测层延展已落地：`OperationEvent.shadow` / `.transformed` 由 emitSql 一份注入路径同时覆盖同步 / 异步；22 项单测 + 全库 543 项 0 失败 |
 
 ---
 
@@ -816,7 +818,7 @@ if (!rs.transformed) cacheStore(key, rs);   // 脱敏结果不进缓存（I10）
 
 - `ResultSet::transformRow(name, fn)` 可变入口（M7 不扩 API 面；当前 `rows()` / `row.data()` 返回 `const &`，业务需自行缓存原始索引或拷贝后再写）。
 - `MaskingInterceptor` 示例代码放 `examples/`（设计稿 §9.3 步骤 3）——本 commit 没新增 examples 目录，建议下一波 M8 同步落地。
-- `OperationEvent` 增加 `transformed` 标记供指标可观测（与 M6 §8.5 的 shadow 字段一起列入下一波统一落地）。
+- `OperationEvent` 增加 `transformed` 标记供指标可观测（与 M6 §8.5 的 shadow 字段一起列入下一波统一落地）——✅ **M9 已落地**。
 
 ---
 

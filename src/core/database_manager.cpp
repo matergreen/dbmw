@@ -188,12 +188,48 @@ void pinRequestWrite() {
         }
 
         template<typename Fn>
+        common::Status observeSqlImpl(const std::string &dataSource,
+                                      const common::OperationType type,
+                                      const std::string &sql,
+                                      const common::Params &params,
+                                      IDatabaseConnection *connection,
+                                      common::ResultSet *result,
+                                      std::uint64_t &rows, Fn &&fn);
+
+        template<typename Fn>
         common::Status observeSql(const std::string &dataSource,
                                   const common::OperationType type,
                                   const std::string &sql,
                                   const common::Params &params,
                                   IDatabaseConnection *connection,
                                   std::uint64_t &rows, Fn &&fn) {
+            return observeSqlImpl(dataSource, type, sql, params, connection,
+                                  /*result=*/nullptr, rows, std::forward<Fn>(fn));
+        }
+
+        // M7 变体：观察器回填 transformed 标记。query 类调用方把 out 透传，
+        // emitSql 会从 result->transformed 写进 event.transformed；其他入口
+        // 走上方观察版的重载，result=nullptr，transformed 保持 false 默认值。
+        template<typename Fn>
+        common::Status observeSql(const std::string &dataSource,
+                                  const common::OperationType type,
+                                  const std::string &sql,
+                                  const common::Params &params,
+                                  IDatabaseConnection *connection,
+                                  common::ResultSet *result,
+                                  std::uint64_t &rows, Fn &&fn) {
+            return observeSqlImpl(dataSource, type, sql, params, connection,
+                                  result, rows, std::forward<Fn>(fn));
+        }
+
+        template<typename Fn>
+        common::Status observeSqlImpl(const std::string &dataSource,
+                                      const common::OperationType type,
+                                      const std::string &sql,
+                                      const common::Params &params,
+                                      IDatabaseConnection *connection,
+                                      common::ResultSet *result,
+                                      std::uint64_t &rows, Fn &&fn) {
             const auto start = std::chrono::steady_clock::now();
             common::Status status = fn();
             common::OperationEvent event;
@@ -204,6 +240,9 @@ void pinRequestWrite() {
             event.status = status;
             event.status.message.clear();
             event.rowCount = rows;
+            // M7：result 透传 → emitSql 在最后会读 result->transformed。
+            // 同步路径 SPI afterExecution 在 runWithInterceptors 末尾被调，
+            // fn() 完成时已经是脱敏后状态；observer 看到的值就是真实值。
             common::SqlRenderer renderer;
             if (connection) {
                 renderer = [connection, &sql, &params](
@@ -211,7 +250,8 @@ void pinRequestWrite() {
                     return connection->renderSqlForLogging(sql, params, options, out);
                 };
             }
-            common::Observability::emitSql(std::move(event), sql, renderer);
+            // result 通过结构体名传参避开内部细节。emitSql 内 reader 会读。
+            common::Observability::emitSql(std::move(event), sql, renderer, result);
             return status;
         }
 
@@ -403,7 +443,7 @@ void pinRequestWrite() {
             std::uint64_t rows = 0;
             const common::Params params;
             const auto status = observeSql(dataSource_, common::OperationType::Query, sql, params,
-                                           h_->get(), rows, [&] {
+                                           h_->get(), &out, rows, [&] {
                 const auto result = (*h_)->query(sql, out);
                 rows = out.rowCount();
                 return result;
@@ -709,7 +749,7 @@ void pinRequestWrite() {
         return runWithInterceptors(view, &out, nullptr, [&] {
             std::uint64_t rows = 0;
             const auto status = observeSql(dataSource_, common::OperationType::Query, "<prepared>",
-                                           params, h_->get(), rows, [&] {
+                                           params, h_->get(), &out, rows, [&] {
                 const auto result = (*h_)->executePrepared(h, params, out);
                 rows = out.rowCount();
                 return result;

@@ -1045,6 +1045,50 @@ auto parent = dbmw::common::formatTraceparent(traceId, spanId);
 55 字节格式实现，与 OpenTelemetry / Jaeger 兼容；flags 段是"采样标记"位，独立于
 traceId / spanId 解析，不会反向污染字段。
 
+### 流量与脱敏标签（shadow / transformed）
+
+`OperationEvent` 额外带两个布尔位，让监控 / 告警 / 计费能在不引入第二条事件流
+的情况下，把生产流量和影子流量、原始结果和脱敏结果分开计数：
+
+| 字段 | 数据来源 | true 的含义 | 关键不变量 |
+|---|---|---|---|
+| `shadow`     | emitSql 读栈顶 `SqlContext.shadow` | 本次 SQL 走的是影子数据源 | 影子流量失败要单独告警；不能和生产共用同一阈值 |
+| `transformed`| observeSql 透传 `ResultSet*`，emitSql 读 `result->transformed` | SPI 已改写 / 裁剪 / 脱敏了结果集 | 失败也要标记——合规审计关心「脱敏路径上是否出现真实数据泄漏」|
+
+```cpp
+dbmw::common::SqlContext ctx;
+ctx.tenantId = "t-acme";
+ctx.shadow   = true;            // 这个租户分流到影子库
+dbmw::common::ContextScope scope(ctx);
+
+// SPI afterExecution 已置 view.result->transformed=true
+dbmw::DBMW::setObserver([](const dbmw::common::OperationEvent &event) {
+    if (event.shadow && event.status.ok()) {
+        shadowQps[event.dataSource]++;
+    }
+    if (event.transformed && !event.status.ok()) {
+        // 失败 + 脱敏：要告警——可能脱敏逻辑自身异常
+        alert("redaction-failure", event.sqlFingerprint);
+    }
+});
+```
+
+**关键约定**：
+
+- **影子标记的同步路径**：`runWithInterceptors` 把 `onRoute` 决策后的 `routeCtx`
+  作为 `ContextScope` 压入线程栈顶，`emitSql` 在最早期读栈顶 → 影子标记与
+  `readTarget` / `writeTargets` 用的是同一份决策，不会出现"标记为影子但路由到主"。
+- **影子标记的异步路径**：`StatementOp::entryCtx` 在 submit 时拍快照，worker
+  执行前 `ContextScope(entryCtx)` 装回，影子标记随 op 跨线程传递且不污染下一次提交。
+- **`transformed` 只来自查询**：write / batch / stream / executePrepared 不带
+  `ResultSet`，`observeSql` 传 `nullptr`，`event.transformed` 默认 false——失败的
+  写不该被算成脱敏失败，标记语义对调用方清晰。
+- **告警阈值建议**：影子流量与生产流量分开告警（影子流量 QPS 高、错误率容忍更大）；
+  脱敏失败要单独告警（哪怕事务失败也可能部分数据已落库/日志，需即时上报）。
+
+测试覆盖 `tests/dbmw_observer_event_test.cpp`（22 项断言 / 8 个场景，包括失败
+事件也必须带这两个标记——告警归因需要）。
+
 ### 指标导出（Prometheus 文本适配器）
 
 M3 把池指标与慢 SQL 统计暴露为标准 Prometheus 文本格式（0.0.4）。**库不内置 HTTP 服务**——

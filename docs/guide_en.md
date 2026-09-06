@@ -995,6 +995,55 @@ auto parent = dbmw::common::formatTraceparent(traceId, spanId);
 and are interoperable with OpenTelemetry / Jaeger. The flags segment is the sampling bit,
 parsed independently from trace/span fields, and cannot reverse-contaminate them.
 
+### Traffic / redaction tags (shadow / transformed)
+
+Two extra booleans on `OperationEvent` let monitoring / alerting / billing separate
+production vs shadow traffic and original vs redacted results without introducing a
+second event stream:
+
+| Field | Data source | When `true` | Key invariant |
+|---|---|---|---|
+| `shadow`     | emitSql reads the top `SqlContext.shadow` | This SQL ran against a shadow data source | Shadow failures should alert separately; do not share thresholds with production |
+| `transformed`| observeSql forwards `ResultSet*`; emitSql reads `result->transformed` | SPI mutated / clipped / redacted the result set | Even failures must be flagged — compliance asks "did the redaction path itself misbehave" |
+
+```cpp
+dbmw::common::SqlContext ctx;
+ctx.tenantId = "t-acme";
+ctx.shadow   = true;            // this tenant routes to the shadow DB
+dbmw::common::ContextScope scope(ctx);
+
+// SPI afterExecution sets view.result->transformed = true above
+dbmw::DBMW::setObserver([](const dbmw::common::OperationEvent &event) {
+    if (event.shadow && event.status.ok()) {
+        shadowQps[event.dataSource]++;
+    }
+    if (event.transformed && !event.status.ok()) {
+        // failure + redaction: alert — redaction logic itself may be misbehaving
+        alert("redaction-failure", event.sqlFingerprint);
+    }
+});
+```
+
+**Key conventions**:
+
+- **Synchronous shadow marking**: `runWithInterceptors` pushes the `onRoute` decision
+  as a `ContextScope` onto the thread stack, then `emitSql` reads from the top of the
+  stack as its very first action — so the marking uses the same decision as
+  `readTarget` / `writeTargets`. No "marked shadow but routed to primary" inconsistency.
+- **Asynchronous shadow marking**: `StatementOp::entryCtx` is snapshotted at submit,
+  and the worker runs `ContextScope(entryCtx)` before execution — the marking crosses
+  threads with the op and cannot leak into the next submission.
+- **`transformed` only comes from queries**: write / batch / stream / executePrepared
+  don't carry a `ResultSet`; `observeSql` passes `nullptr` for them and
+  `event.transformed` stays default-false — failed writes are NOT counted as
+  "redaction failures"; the semantics stay unambiguous for callers.
+- **Alerting thresholds**: separate alerts for shadow traffic (high QPS, looser error
+  tolerance) vs production; redaction failures deserve a dedicated alert, because part
+  of the data may already have hit logs / the network even when the transaction failed.
+
+Tests: `tests/dbmw_observer_event_test.cpp` (22 assertions / 8 scenarios — incl.
+failed events must still carry both flags, because alert attribution needs them).
+
 ### Metrics export (Prometheus text adapter)
 
 M3 exposes pool metrics and slow SQL statistics as Prometheus text format (0.0.4).

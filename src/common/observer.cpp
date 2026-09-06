@@ -434,8 +434,9 @@ namespace dbmw::common {
         while (g_recentSlow.size() > recentCapacity) g_recentSlow.pop_front();
     }
 
-    void Observability::emitSql(OperationEvent event, const std::string &sql,
-                                const SqlRenderer &renderer) noexcept {
+void Observability::emitSql(OperationEvent event, const std::string &sql,
+                            const SqlRenderer &renderer,
+                            const common::ResultSet *result) noexcept {
         try {
             // 热路径：配置与观察者都取自线程本地快照，完全不碰全局锁。
             // 每条 SQL 都会经过这里，这是本文件最值得优化的地方。
@@ -456,6 +457,13 @@ namespace dbmw::common {
             // （与 nextSpanId "不发幽灵 span" 同源）；spanId 沿用调用方栈顶的，
             // 调用方未填则按语句自动生成 16 hex 子跨度，便于在调用方不感知
             // 追踪的情况下，按"次请求 = 多条 SQL"颗粒度对齐链路。
+            //
+            // M6（shadow）+ M7（transformed）也在这里集中读栈顶 ctx：
+            // - shadow 由 onRoute 写入 routeCtx，runWithInterceptors 已 push 上栈
+            // - transformed 由 SPI 改写 result 后置 true；传入 result 指针就
+            //   能读到（M6/M7 共享 emitSql 入口）。
+            // 同步路径栈顶 = 调用方 + runWithInterceptors inner 帧；异步路径
+            // worker 已装回 entryCtx，所以读栈顶语义在两路径下都成立。
             {
                 const SqlContext &ctx = ContextScope::current();
                 if (!ctx.traceId.empty()) event.traceId = ctx.traceId;
@@ -466,7 +474,10 @@ namespace dbmw::common {
                     // 制造"无主 span"混淆聚合视图。
                     event.spanId = nextSpanId();
                 }
+                if (ctx.shadow) event.shadow = true;
             }
+            // M7：result 由 observeSql 透传；为空时 transformed 保持默认 false。
+            if (result && result->transformed) event.transformed = true;
 
             // P1-1：观测全关（无观察者、慢 SQL 与 SQL 日志都关）时，
             // 直接返回，省掉结构化扫描和 fingerprint 的 O(n) 开销。

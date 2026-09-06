@@ -48,6 +48,16 @@ namespace dbmw::common {
         std::string traceId;
         std::string spanId;
         bool slow = false;
+        // M6：onRoute 决策把整组流量切到影子数据源时为 true。
+        // 同步路径由 runWithInterceptors 推 view.ctx 上栈、emitSql 读栈顶；
+        // 异步路径 worker 已 push entryCtx，emitSql 同样拿得到一致值。
+        // 用于"压测流量 vs 生产"在指标系统里分开计费、告警阈值。
+        bool shadow = false;
+        // M7：afterExecution 改写过 result 时为 true（脱敏/裁剪/格式转换等都算）。
+        // 同步路径由 observeSql 在 fn() 之后从 result 指针回填；
+        // 异步路径的 result 是 ResultSet by-value，emitSql 同样能读。
+        // 用于"业务是否做了改写"在合规审计里计数，与 I10 缓存守卫表里同源。
+        bool transformed = false;
     };
 
     struct SlowSqlStats {
@@ -120,7 +130,8 @@ namespace dbmw::common {
 
         static void configure(const config::ObservabilityConfig &config);
         static void emitSql(OperationEvent event, const std::string &sql,
-                            const SqlRenderer &renderer = {}) noexcept;
+                            const SqlRenderer &renderer = {},
+                            const common::ResultSet *result = nullptr) noexcept;
         static std::vector<SlowSqlStats> slowSqlStats(
             std::size_t limit = 100, const std::string &dataSource = {});
         static std::vector<SlowSqlRecord> recentSlowSql(

@@ -60,6 +60,7 @@ add_executable(dbmw_raw_session_test dbmw_raw_session_test.cpp)
 target_link_libraries(dbmw_raw_session_test PRIVATE dbmw)
 target_link_libraries(dbmw_raw_session_test PRIVATE Threads::Threads)
 add_test(NAME dbmw_raw_session_test COMMAND dbmw_raw_session_test)
+add_test(NAME dbmw_observer_event_test COMMAND dbmw_observer_event_test)
 
 # M7 结果脱敏单测：SPI afterExecution 改写 view.result → 置位
 # rs.transformed=true → cacheStore/queryUngated 守卫硬拦截，I10 落地；
@@ -76,6 +77,15 @@ target_link_libraries(dbmw_redaction_test PRIVATE dbmw)
 # ⑤ 与 M5 幂等、M6 影子正交不冲突。无真实数据库依赖。
 add_executable(dbmw_raw_session_test dbmw_raw_session_test.cpp)
 target_link_libraries(dbmw_raw_session_test PRIVATE dbmw)
+
+# M9 观测层延展单测：OperationEvent.shadow / .transformed 字段填充。
+#   - shadow 由 emitSql 内读栈顶 SqlContext（同步路径由 runWithInterceptors
+#     push 路由后的 view.ctx；异步路径 worker 已 push entryCtx）；
+#   - transformed 由 observeSql 透传 ResultSet 指针，emitSql 读 result-
+#     >transformed 写进 event（query 类以外 result=nullptr，保持默认 false）。
+#   不走真实驱动，全用 emitSql 直调，验证字段注入逻辑独立稳定。
+add_executable(dbmw_observer_event_test dbmw_observer_event_test.cpp)
+target_link_libraries(dbmw_observer_event_test PRIVATE dbmw)
 
 # 真实数据库集成测试默认不构建，避免普通单元测试依赖外部服务；
 # 开启时由各 DBMW_TEST_* 环境变量提供连接信息，测试只操作自己的临时对象。
@@ -121,6 +131,7 @@ if(Threads_FOUND)
     target_link_libraries(dbmw_shadow_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_redaction_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_raw_session_test PRIVATE Threads::Threads)
+    target_link_libraries(dbmw_observer_event_test PRIVATE Threads::Threads)
     if(TARGET dbmw_coro_test)
         target_link_libraries(dbmw_coro_test PRIVATE Threads::Threads)
     endif()
@@ -146,3 +157,4 @@ add_test(NAME dbmw_idempotency_test COMMAND dbmw_idempotency_test)
 add_test(NAME dbmw_shadow_test COMMAND dbmw_shadow_test)
 add_test(NAME dbmw_redaction_test COMMAND dbmw_redaction_test)
 add_test(NAME dbmw_raw_session_test COMMAND dbmw_raw_session_test)
+add_test(NAME dbmw_observer_event_test COMMAND dbmw_observer_event_test)
