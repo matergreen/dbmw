@@ -23,6 +23,10 @@ namespace dbmw::common {
         std::mutex g_statsMutex;
         OperationObserver g_observer;
         config::ObservabilityConfig g_config;
+        // M3 池指标通道：与 SQL 通道共用 g_stateMutex（配置/句柄同时变更极少），
+        // 复用 g_stateVersion 让线程本地快照一致刷新。
+        PoolMetricsObserver g_poolObserver;
+        PoolMetricsCollector g_poolCollector;
         // 配置或观察者每次变更时递增；线程据此判断本地快照是否已过期。
         std::atomic<std::uint64_t> g_stateVersion{1};
         std::unordered_map<std::uint64_t, SlowSqlStats> g_slowStats;
@@ -35,6 +39,9 @@ namespace dbmw::common {
         struct Snapshot {
             config::ObservabilityConfig config;
             OperationObserver observer;
+            // M3 池指标通道：与 SQL 通道一并缓存。
+            PoolMetricsObserver poolObserver;
+            PoolMetricsCollector poolCollector;
         };
 
         // 每线程缓存一份快照，只在版本号变化时才回退加锁刷新。
@@ -50,6 +57,8 @@ namespace dbmw::common {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             tlsSnapshot.config = g_config;
             tlsSnapshot.observer = g_observer;
+            tlsSnapshot.poolObserver = g_poolObserver;
+            tlsSnapshot.poolCollector = g_poolCollector;
             tlsVersion = g_stateVersion.load(std::memory_order_acquire);
             return tlsSnapshot;
         }
@@ -318,6 +327,58 @@ namespace dbmw::common {
         // 版本号在锁外递增即可：需要刷新的线程会重新加锁读取，
         // 这里只需保证"变更后版本号一定比之前大"。
         g_stateVersion.fetch_add(1, std::memory_order_release);
+    }
+
+    void Observability::setPoolMetricsObserver(PoolMetricsObserver observer) {
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            g_poolObserver = std::move(observer);
+        }
+        g_stateVersion.fetch_add(1, std::memory_order_release);
+    }
+
+    void Observability::setPoolMetricsCollector(PoolMetricsCollector collector) {
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            g_poolCollector = std::move(collector);
+        }
+        g_stateVersion.fetch_add(1, std::memory_order_release);
+    }
+
+    PoolMetricsEvent Observability::samplePoolMetrics() noexcept {
+        // 采+分发不在每条 SQL 的热路径上（采集器周期性调），但仍要 noexcept：
+        // 任何抛出的异常都吞掉，不影响调用方。
+        PoolMetricsEvent event;
+        event.timestamp = std::chrono::system_clock::now();
+        try {
+            PoolMetricsCollector collector;
+            PoolMetricsObserver observer;
+            {
+                // 锁内只读两个槽位 + 拷贝 std::function；不持锁调 collector。
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                collector = g_poolCollector;
+                observer = g_poolObserver;
+            }
+            // collector 可能抛（业务侧自己写的 lambda）；任何异常一律吞掉。
+            if (collector) {
+                try {
+                    event.pools = collector();
+                } catch (...) {
+                    event.pools.clear();
+                }
+            }
+            // 观察者未注册就直接返回：samplePoolMetrics 也可以当"立即采样快照"。
+            if (observer) {
+                try {
+                    observer(event);
+                } catch (...) {
+                    // 观测系统不得改变业务语义。
+                }
+            }
+        } catch (...) {
+            // 任何意外（拷贝 observer/collector 抛 bad_function_call 等）也兜住。
+        }
+        return event;
     }
 
     void Observability::emit(const OperationEvent &event) noexcept {

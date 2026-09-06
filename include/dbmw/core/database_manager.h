@@ -328,10 +328,9 @@ namespace dbmw {
     // 会话回调：返回非 ok 表示失败（事务场景会触发回滚）。
     using SessionFn = std::function<common::Status(Session &)>;
 
-    struct NamedPoolStats {
-        std::string dataSource;
-        ConnectionPool::Stats stats;
-    };
+    // 已下沉到 common/connection_pool_stats.h（M3 解除循环 include），
+    // 此处保留同名别名，所有旧调用方零改动。
+    using NamedPoolStats = common::NamedPoolStats;
 
     // 面向应用的单数据源句柄：内部从连接池借连接执行（RAII）。
     //

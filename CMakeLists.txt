@@ -95,6 +95,8 @@ set(DBMW_SOURCES
     src/driver/postgres_driver.cpp
     src/driver/odbc_driver.cpp
     src/dbmw.cpp
+    # M3 指标导出：Prometheus 文本适配器（无驱动依赖，永久参与编译）。
+    src/exporters/prometheus.cpp
 )
 
 # 协程层：独立 OBJECT 库，单独提标 C++20。

@@ -11,6 +11,7 @@
 #include <iostream>
 #include <mutex>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -284,13 +285,26 @@ int main() {
         const std::string allText = exporters::toPrometheusText(evt, slow, "dbmw", 0);
         const std::string cutText = exporters::toPrometheusText(evt, slow, "dbmw", 2);
 
-        const int allFp = countMatches(allText,
-            std::string(R"(fingerprint="1\d{3}")"));
-        const int cutFp = countMatches(cutText,
-            std::string(R"(fingerprint="1\d{3}")"));
+        // 每条慢 SQL 会被多 metric（count/errors/timeouts/duration_sum/duration_max/
+        // duration_seconds_bucket × 多 bucket）共享同一个 fingerprint 标签，
+        // 因此同一 fingerprint 会出现多次。需要 unique 计数。
+        // 用普通字符串拼接避免 raw string 与正则括号的歧义。
+        auto countUnique = [](const std::string &text) {
+            const std::string pattern = "fingerprint=\"(10[0-9]{2})\"";
+            std::regex re(pattern);
+            std::set<std::string> seen;
+            auto begin = std::sregex_iterator(text.begin(), text.end(), re);
+            auto end = std::sregex_iterator();
+            for (auto it = begin; it != end; ++it) {
+                seen.insert((*it)[1].str());
+            }
+            return static_cast<int>(seen.size());
+        };
+        const int allUnique = countUnique(allText);
+        const int cutUnique = countUnique(cutText);
 
-        check(allFp == 5, "不限时 5 条 fingerprint 全部出现");
-        check(cutFp == 2, "maxFingerprintLabels=2 时仅前 2 条出现");
+        check(allUnique == 5, "不限时 5 条 fingerprint 全部出现（unique 计数）");
+        check(cutUnique == 2, "maxFingerprintLabels=2 时仅前 2 条出现（unique 计数）");
     }
 
     std::cout << "== M3 指标导出：空输入 ==\n";

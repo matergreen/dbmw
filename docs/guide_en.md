@@ -763,6 +763,69 @@ auto parent = dbmw::common::formatTraceparent(traceId, spanId);
 and are interoperable with OpenTelemetry / Jaeger. The flags segment is the sampling bit,
 parsed independently from trace/span fields, and cannot reverse-contaminate them.
 
+### Metrics export (Prometheus text adapter)
+
+M3 exposes pool metrics and slow SQL statistics as Prometheus text format (0.0.4).
+**The library does not embed an HTTP server** — the `/metrics` endpoint is the application's
+or sidecar's responsibility. This section shows how to feed the data source to them.
+
+#### 1. Register a pool metrics observer
+
+```cpp
+#include "dbmw/common/observer.h"
+
+// DatabaseManager::init() already calls setPoolMetricsCollector(this { return allPoolStats(); }),
+// so the collector is normally already in place. Override it only if you have a different source.
+dbmw::common::Observability::setPoolMetricsObserver(
+    [](const dbmw::common::PoolMetricsEvent &e) {
+        // e is delivered every StatsReportConfig.interval_ms (or call samplePoolMetrics() on demand).
+        const auto text = dbmw::exporters::toPrometheusText(e, {});
+        // text feeds your Prometheus scraper (pushgateway / HTTP handler).
+    });
+```
+
+Alternatively, skip the observer and pull on demand:
+
+```cpp
+const auto pools = dbmw::common::Observability::samplePoolMetrics();
+```
+
+#### 2. Prometheus text format
+
+```cpp
+const auto pools = dbmw::common::Observability::samplePoolMetrics();
+const auto slow  = dbmw::common::Observability::slowSqlStats(100);
+const auto text  = dbmw::exporters::toPrometheusText(pools, slow);
+
+// Key metric names (default prefix="dbmw"):
+//   dbmw_pool_connections{data_source="app",state=...}
+//   dbmw_pool_connections_idle / _borrowed / _max / _min
+//   dbmw_pool_utilization_ratio{data_source="..."}
+//   dbmw_pool_waiting{data_source="..."}
+//   dbmw_pool_borrow_requests_total / _successes / _timeouts / _wait_seconds_total
+//   dbmw_pool_connections_created_total / _closed_total
+//   dbmw_pool_validation_failures_total / _leak_warnings_total
+//   dbmw_slow_sql_count{data_source="...",fingerprint="..."}
+//   dbmw_slow_sql_errors / _timeouts / _duration_seconds_sum / _max
+//   dbmw_slow_sql_duration_seconds_bucket{...,le="0.01|0.1|1|+Inf"}
+```
+
+#### 3. Important constraints
+
+- **fingerprint is a high-cardinality label** that can blow up a TSDB. Pass
+  `maxFingerprintLabels` to `toPrometheusText` to cap the number of slow SQL entries
+  (truncated in input order). A reasonable cap like 50 is strongly recommended.
+- **All label values are Prometheus-escaped**: `\\` `\"` `\n` and other control characters
+  will not break parsing.
+- **The `+Inf` bucket always equals `count`**: the cumulative count terminates at the last
+  finite bucket, then writes `le="+Inf"` = total samples — the Prometheus histogram convention.
+- **Observer exceptions never affect business**: a callback throwing is swallowed, the
+  library keeps running; but the exception means the exporter misses this snapshot —
+  logging and retries are the caller's responsibility.
+- **StatsReporter reuses the existing period**: when `cfg.include_pool=true`,
+  `StatsReporter::writeOnce` also calls `samplePoolMetrics()` and drives the observer —
+  no need for a separate exporter thread.
+
 ## Error codes
 
 `common::Status` carries an `ErrorCode`, convertible to a string via `common::errorCodeToString()`.

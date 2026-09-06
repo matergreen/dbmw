@@ -122,6 +122,11 @@ namespace dbmw::core {
         const auto now = std::chrono::system_clock::now();
         std::vector<NamedPoolStats> pools;
         if (cfg_.include_pool && collector_) pools = collector_();
+        // M3 池指标观察者通道：与文件落盘共用 cfg_.include_pool 开关；
+        // samplePoolMetrics 内部已 try/catch 兜住所有异常，不影响 writeOnce 主路径。
+        if (cfg_.include_pool) {
+            (void)common::Observability::samplePoolMetrics();
+        }
         std::vector<common::SlowSqlStats> slowSql;
         if (cfg_.include_slow_sql) {
             slowSql = common::Observability::slowSqlStats(

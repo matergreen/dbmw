@@ -815,6 +815,65 @@ auto parent = dbmw::common::formatTraceparent(traceId, spanId);
 55 字节格式实现，与 OpenTelemetry / Jaeger 兼容；flags 段是"采样标记"位，独立于
 traceId / spanId 解析，不会反向污染字段。
 
+### 指标导出（Prometheus 文本适配器）
+
+M3 把池指标与慢 SQL 统计暴露为标准 Prometheus 文本格式（0.0.4）。**库不内置 HTTP 服务**——
+`/metrics` 端口是应用或 sidecar 的职责，本节展示如何把数据源接给它们。
+
+#### 1. 注册池指标观察者
+
+```cpp
+#include "dbmw/common/observer.h"
+
+// 在 DatabaseManager::init() 完成后注入 collector；
+// init() 内部已经做了，所以通常不必手动再调一次。
+dbmw::common::Observability::setPoolMetricsCollector([&mgr] {
+    return mgr.allPoolStats();
+});
+
+dbmw::common::Observability::setPoolMetricsObserver(
+    [](const dbmw::common::PoolMetricsEvent &e) {
+        // 立即采一次：可挂在 Prometheus exporter 自己的周期里。
+        // 也可以等 StatsReporter::writeOnce 每 interval_ms 触发一次。
+        const auto text = dbmw::exporters::toPrometheusText(e, {});
+        // text 交给 Prometheus scraper（pushgateway / HTTP handler）。
+    });
+```
+
+或者**不写观察者**，直接调用 `Observability::samplePoolMetrics()` 拿快照（按需拉取）。
+
+#### 2. Prometheus 文本格式
+
+```cpp
+const auto pools = dbmw::common::Observability::samplePoolMetrics();
+const auto slow  = dbmw::common::Observability::slowSqlStats(100);
+const auto text  = dbmw::exporters::toPrometheusText(pools, slow);
+
+// 关键指标名（默认 prefix="dbmw"）：
+//   dbmw_pool_connections{data_source="app",state=...}
+//   dbmw_pool_connections_idle / _borrowed / _max / _min
+//   dbmw_pool_utilization_ratio{data_source="..."}
+//   dbmw_pool_waiting{data_source="..."}
+//   dbmw_pool_borrow_requests_total / _successes / _timeouts / _wait_seconds_total
+//   dbmw_pool_connections_created_total / _closed_total
+//   dbmw_pool_validation_failures_total / _leak_warnings_total
+//   dbmw_slow_sql_count{data_source="...",fingerprint="..."}
+//   dbmw_slow_sql_errors / _timeouts / _duration_seconds_sum / _max
+//   dbmw_slow_sql_duration_seconds_bucket{...,le="0.01|0.1|1|+Inf"}
+```
+
+#### 3. 重要约束
+
+- **fingerprint 是高基数标签**：时序库会被撑爆。`toPrometheusText` 接 `maxFingerprintLabels`
+  参数限制导出数量（按传入顺序截断），强烈建议填一个合理上限（例如 50）。
+- **所有 label value 都按 Prometheus 转义**：`\\` `\"` `\n` 与其它控制字符都不会破坏解析。
+- **`+Inf` 桶固定 = count**：histogram bucket 的累积在最后一个有限 bucket 终止，最后
+  写入 `le="+Inf"` = 总样本数，符合 Prometheus 直方图惯例。
+- **观察者异常不影响业务**：`setPoolMetricsObserver` 的回调抛错会被吞掉，库照常运行；
+  但**异常**意味着 exporter 拿不到这次快照——日志与重试由调用方负责。
+- **StatsReporter 复用周期**：`cfg.include_pool=true` 时 `StatsReporter::writeOnce` 也会
+  调一次 `samplePoolMetrics()`，自动驱动观察者；不必让 exporter 单独再启一条线程。
+
 ## 错误码
 
 `common::Status` 携带 `ErrorCode`，可用 `common::errorCodeToString()` 转成字符串。

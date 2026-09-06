@@ -1,6 +1,7 @@
 #ifndef DBMW_COMMON_OBSERVER_H
 #define DBMW_COMMON_OBSERVER_H
 
+#include "dbmw/common/connection_pool_stats.h"
 #include "dbmw/common/types.h"
 #include "dbmw/config/datasource_config.h"
 
@@ -86,6 +87,20 @@ namespace dbmw::common {
     using OperationObserver = std::function<void(const OperationEvent &)>;
     using SqlRenderer = std::function<Status(const SqlRenderOptions &, std::string &)>;
 
+    // M3 池指标推送：复用 common::NamedPoolStats（已在 connection_pool_stats.h 定义），
+    // 不再造新类型。外部采集器（如 Prometheus exporter）只接这个事件，
+    // 不接 OperationEvent——池指标频率与 SQL 指标频率不同，分通道避免互相拖累。
+    struct PoolMetricsEvent {
+        std::chrono::system_clock::time_point timestamp;
+        std::vector<NamedPoolStats> pools;
+    };
+
+    using PoolMetricsObserver = std::function<void(const PoolMetricsEvent &)>;
+    // 由 DatabaseManager 在 init() 期间注入到 Observability，让 samplePoolMetrics
+    // 能拿到所有数据源的实时快照。签名与 StatsReporter::PoolStatsCollector 一致，
+    // 复用同一形态，避免再发明回调类型。
+    using PoolMetricsCollector = std::function<std::vector<NamedPoolStats>()>;
+
     class Observability {
     public:
         Observability() = delete;
@@ -93,6 +108,15 @@ namespace dbmw::common {
         // 进程级观察器。传入空函数可关闭；回调抛出的异常会被中间件吞掉。
         static void setObserver(OperationObserver observer);
         static void emit(const OperationEvent &event) noexcept;
+
+        // M3 池指标通道。
+        // 槽位与 collector 都是进程级单例；回调抛出的异常会被吞掉。
+        static void setPoolMetricsObserver(PoolMetricsObserver observer);
+        // 注入"如何采"：由 DatabaseManager 在 init() 注入，回调里调用
+        // mgr.allPoolStats()。未注入时 samplePoolMetrics() 返回空事件但不调观察者。
+        static void setPoolMetricsCollector(PoolMetricsCollector collector);
+        // 立即采一次并送进观察者。供采集器按需拉取，不必等周期。空 collector 时静默。
+        static PoolMetricsEvent samplePoolMetrics() noexcept;
 
         static void configure(const config::ObservabilityConfig &config);
         static void emitSql(OperationEvent event, const std::string &sql,

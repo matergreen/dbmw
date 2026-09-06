@@ -2254,6 +2254,11 @@ namespace dbmw::core {
         }
 
         common::Observability::configure(cfg.observability);
+        // M3 池指标推送通道：把采集能力注入到 Observability，让外部观察者
+        // （Prometheus exporter 等）按周期或按需拿到全量数据源快照。
+        // 此处 lambda 只读 pools_，自身不需要锁；DatabaseManager::allPoolStats()
+        // 内部会加 mtx_。
+        common::Observability::setPoolMetricsCollector([this] { return allPoolStats(); });
 
         // 统计报告放在最后启动：此时新池与新数据源都已就位，采集回调拿到的
         // 必然是完整状态。start() 内部会先停掉上一版线程，因此热加载时
