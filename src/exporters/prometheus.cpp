@@ -14,7 +14,7 @@ namespace dbmw::exporters {
         //   - \\ -> \\\\
         //   - \" -> \\\"
         //   - \n -> \\n
-        // 其它控制字符按 \\u00XX 输出，避免破坏解析。
+        // 其它控制字符替换为 '?'，避免产生 exposition 格式不支持的转义。
         std::string escapeLabel(const std::string &s) {
             std::string out;
             out.reserve(s.size() + 8);
@@ -25,10 +25,9 @@ namespace dbmw::exporters {
                     case '\n': out += "\\n"; break;
                     default:
                         if (static_cast<unsigned char>(c) < 0x20) {
-                            char buf[8];
-                            std::snprintf(buf, sizeof(buf), "\\u%04x",
-                                          static_cast<unsigned char>(c));
-                            out += buf;
+                            // Prometheus text exposition 只定义 \\, \" 与 \n；
+                            // \uXXXX 会被解析器判为非法 escape。
+                            out.push_back('?');
                         } else {
                             out += c;
                         }
@@ -274,12 +273,14 @@ namespace dbmw::exporters {
             const std::string s_count = prefix + "_slow_sql_count";
             const std::string s_err = prefix + "_slow_sql_errors";
             const std::string s_to = prefix + "_slow_sql_timeouts";
-            const std::string s_sum = prefix + "_slow_sql_duration_seconds_sum";
+            const std::string s_duration = prefix + "_slow_sql_duration_seconds";
+            const std::string s_sum = s_duration + "_sum";
             const std::string s_max = prefix + "_slow_sql_duration_seconds_max";
-            const std::string s_hist = prefix + "_slow_sql_duration_seconds_bucket";
+            const std::string s_hist = s_duration + "_bucket";
+            const std::string s_hist_count = s_duration + "_count";
 
             bool count_emitted = false, err_emitted = false, to_emitted_s = false;
-            bool sum_emitted = false, max_emitted_s = false, hist_emitted = false;
+            bool duration_family_emitted = false, max_emitted_s = false;
 
             for (std::size_t i = 0; i < take; ++i) {
                 const auto &s = slow[i];
@@ -309,10 +310,10 @@ namespace dbmw::exporters {
                 }
                 emitMetric(os, s_to, lbl, s.timeoutCount);
 
-                if (!sum_emitted) {
-                    emitHelp(os, s_sum, "Cumulative slow SQL duration in seconds.");
-                    emitType(os, s_sum, "counter");
-                    sum_emitted = true;
+                if (!duration_family_emitted) {
+                    emitHelp(os, s_duration, "Slow SQL duration histogram in seconds.");
+                    emitType(os, s_duration, "histogram");
+                    duration_family_emitted = true;
                 }
                 // totalDuration 微秒转秒
                 emitMetric(os, s_sum, lbl,
@@ -326,11 +327,6 @@ namespace dbmw::exporters {
                 emitMetric(os, s_max, lbl,
                            static_cast<double>(s.maxDuration.count()) / 1e6);
 
-                if (!hist_emitted) {
-                    emitHelp(os, s_hist, "Slow SQL duration histogram (seconds).");
-                    emitType(os, s_hist, "counter");
-                    hist_emitted = true;
-                }
                 // histogram bucket
                 //   s.histogramBucketsMs 与 s.histogram 等长（同步构造），
                 //   这里逐个 bucket 输出 {le="<sec>"} cumulative count；
@@ -361,6 +357,7 @@ namespace dbmw::exporters {
                     });
                     emitMetric(os, s_hist, bucketLbl, s.count);
                 }
+                emitMetric(os, s_hist_count, lbl, s.count);
             }
         }
 

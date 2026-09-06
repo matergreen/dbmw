@@ -259,15 +259,18 @@ namespace dbmw {
     class Cursor {
     public:
         enum class Binding { OwnsHandle, BorrowedInSession };
+        using RowTransform = std::function<void(common::Row &)>;
 
         Cursor(std::unique_ptr<ConnectionPool::Handle> h,
                std::unique_ptr<ICursor> impl,
                Session::AuditContext audit,
                Binding binding,
-               std::shared_ptr<void> cursorLease = {})
+               std::shared_ptr<void> cursorLease = {},
+               RowTransform rowTransform = {})
             : handle_(std::move(h)), impl_(std::move(impl)),
               audit_(std::move(audit)), binding_(binding),
-              cursorLease_(std::move(cursorLease)) {}
+              cursorLease_(std::move(cursorLease)),
+              rowTransform_(std::move(rowTransform)) {}
 
         Cursor(const Cursor &) = delete;
         Cursor &operator=(const Cursor &) = delete;
@@ -279,7 +282,14 @@ namespace dbmw {
         common::Status fetch(std::size_t n, common::ResultSet &out) {
             if (!impl_) return common::Status::error(common::ErrorCode::CursorClosed,
                                                     "cursor already closed or moved-from");
-            return impl_->fetch(n, out);
+            const auto firstNewRow = out.rowCount();
+            const auto status = impl_->fetch(n, out);
+            if (status.ok() && rowTransform_) {
+                auto &rows = out.mutableRows();
+                for (std::size_t i = firstNewRow; i < rows.size(); ++i)
+                    rowTransform_(rows[i]);
+            }
+            return status;
         }
 
         // 取单行；无更多行时 ok=false（正常 EOF，非错误）。
@@ -287,7 +297,9 @@ namespace dbmw {
             ok = false;
             if (!impl_) return common::Status::error(common::ErrorCode::CursorClosed,
                                                     "cursor already closed or moved-from");
-            return impl_->fetchRow(out, ok);
+            const auto status = impl_->fetchRow(out, ok);
+            if (status.ok() && ok && rowTransform_) rowTransform_(out);
+            return status;
         }
 
         // 显式关闭；幂等。BorrowedInSession 不归还连接（归 Session）。
@@ -324,6 +336,7 @@ namespace dbmw {
         // 叶子 DataSource 的并发游标配额租约；reset/析构时由自定义 deleter
         // 原子归还。独立共享状态保证热加载销毁 DataSource 后仍可安全关闭。
         std::shared_ptr<void> cursorLease_;
+        RowTransform rowTransform_;
     };
 
     // 会话回调：返回非 ok 表示失败（事务场景会触发回滚）。
@@ -345,7 +358,7 @@ namespace dbmw {
         // （也可传 nullptr）。这样复用既有 createRateLimiter 入口，
         // 并保证每个数据源独立令牌桶；如不传，按 "global_qps<=0 即不限" 创建。
         std::shared_ptr<RateLimiter> rate_limiter = nullptr;
-        // 单数据源自身不带只读标志——只读是组级约束，默认关闭。
+        // 动态叶子的只读标志（配合全局 sql_audit.enforce_read_only）。
         bool read_only = false;
         // 游标能力开关与上限（max_open_cursors 等）。
         config::CursorConfig cursor = {};
@@ -639,7 +652,7 @@ namespace dbmw {
         // 该数据源/组是否只读（配合全局 sql_audit.enforce_read_only 才会拦截）。
         bool readOnly_ = false;
         // 是否为读副本（驱动 cache_on_replica_only）。
-        bool readReplica_ = false;
+        std::atomic<bool> readReplica_{false};
         // 主库故障转移：有序可写候选（主置顶）。为空表示不启用转移，写只走主。
         std::vector<std::shared_ptr<DataSource>> failoverPrimaries_;
         // 故障转移是否要求候选连接池健康（true 时跳过 pool 已销毁的候选）。
@@ -668,6 +681,7 @@ namespace dbmw {
     // 定时统计报告。完整定义只对实现可见，
     // 这样本头文件不必反向依赖统计模块（那边需要用到这里的 NamedPoolStats）。
     class StatsReporter;
+    struct PoolCollectorLease;
 
     // 多数据源管理器：加载配置 -> 建池 -> 启动心跳 -> 按名分发。
     // 整个进程通常持有一个实例（见 dbmw.h 门面）。
@@ -809,6 +823,9 @@ namespace dbmw {
         // 它的采集回调会读 pools_，因此必须在 shutdown 里先于池与数据源停止，
         // 否则线程会比被采集对象活得久，回调直接踩到悬垂引用。
         std::unique_ptr<StatsReporter> statsReporter_;
+        // 保护 Observability 中可能已被其它线程复制的采集回调，避免 shutdown
+        // 与 samplePoolMetrics 并发时访问已析构的 manager。
+        std::shared_ptr<PoolCollectorLease> poolCollectorLease_;
     };
 
 } // namespace core

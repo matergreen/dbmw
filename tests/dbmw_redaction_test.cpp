@@ -1,9 +1,8 @@
 // dbmw v0.4.0 M7 单测：结果脱敏（I10 落地）§9。
 //
 // 覆盖（docs/roadmap-design-v0.4.0.md §9.4 风险表 + §9.3 落地步骤）：
-//   1. SPI afterExecution 改写 view.result → 置位 rs.transformed=true
-//      → QueryCache::put 守卫命中 → 脱敏结果不进缓存（I10 核心）。
-//   2. 第二次同 SQL：缓存未命中 → 仍走 driver 调用 → 再次触发脱敏拦截器。
+//   1. QueryCache 只保存驱动原始结果，SPI afterExecution 在返回前改写副本。
+//   2. 第二次同 SQL：命中原始缓存，仍再次触发脱敏拦截器。
 //   3. 未脱敏的读照常进缓存（I10 不误伤）。
 //   4. 缓存命中路径仍要调 afterExecution（§9.4 风险行：缓存命中漏脱敏）。
 //   5. 异步路径下脱敏 + 缓存交互同源：transformed 进缓存被守卫拦截，
@@ -95,6 +94,7 @@ struct RedactionInterceptor : public core::ISqlInterceptor {
     bool enableTransform = true;       // 总开关（影响是否置 transformed）
     std::string maskedValue = "***";   // 改写后的值
     std::atomic<int> afterCount{0};    // 调用计数（验证 §9.4 缓存命中是否漏调）
+    std::atomic<int> rowCount{0};
 
     void onRoute(const std::string &, const std::string &,
                  common::OperationType, common::SqlContext &) override {}
@@ -114,16 +114,16 @@ struct RedactionInterceptor : public core::ISqlInterceptor {
         (void)view.result->rows();     // 留作"业务可遍历"的接口演示
     }
 
+    void onRow(const core::ExecutionView &, common::Row &row) override {
+        ++rowCount;
+        if (enableTransform && row.has("secret")) row.set("secret", maskedValue);
+    }
+
     void onCompletion(const core::ExecutionView &) override {}
 };
 
 // ---------------------------------------------------------------------------
-// M7.1 同步路径：脱敏读不进缓存（I10 核心）。
-// 配置 query_cache=true，调两次同一 SQL：
-//   第一次 → driver + 脱敏拦截器改写 + transformed=true → 不进缓存。
-//   第二次 → 缓存未命中 → driver 再次调 → 再次脱敏。
-// 若 I10 守卫漏掉，第二次 cacheLookup 命中后 view.result 已是缓存里的
-// 脱敏版本（被前置行替换过），拦截器不会再跑——driver 调用次数会停在 1。
+// M7.1 同步路径：缓存原始结果，命中后按请求重新脱敏（I10 核心）。
 // ---------------------------------------------------------------------------
 static void test_sync_redaction_not_cached() {
     std::cout << "== M7.1 同步路径：脱敏读不进缓存（I10 核心）==\n";
@@ -158,14 +158,21 @@ static void test_sync_redaction_not_cached() {
     check(rs2.transformed, "第二次读：rs.transformed=true（每次都重脱敏）");
     check(rs2.rowCount() == 1, "第二次读：1 行");
 
-    // driver 调了 2 次 = 缓存未命中两次（I10 阻止脱敏结果入库）。
-    check(gMockQueryCount.load() == 2,
-          "I10：driver 调用 2 次（脱敏结果未污染缓存）");
-    // afterExecution 至少 2 次（DataSource 公开入口层）。注意：DataSource::query
-    // 内部还会经 Session::query 再发一次拦截回调，所以总次数 = DataSource 层 +
-    // Session 层 + 缓存命中时仅 DataSource 层。
-    check(redact->afterCount.load() >= 3,
-          "afterExecution ≥3 次（DataSource + Session + 缓存命中 DataSource）");
+    check(gMockQueryCount.load() == 1,
+          "I10：driver 只调用 1 次，缓存保存的是原始结果");
+    check(redact->afterCount.load() == 2,
+          "每个公开 query 恰好执行一次 afterExecution");
+
+    std::uint64_t streamedRows = 0;
+    std::string streamedSecret;
+    check(g->queryEach("SELECT secret", {}, [&](const common::Row &row) {
+              if (const auto *value = std::get_if<std::string>(&row.at("secret")))
+                  streamedSecret = *value;
+              return true;
+          }, streamedRows).ok() && streamedRows == 1,
+          "queryEach 正常逐行交付");
+    check(streamedSecret == "***" && redact->rowCount.load() == 1,
+          "queryEach 在业务回调前恰好执行一次 onRow 脱敏");
 
     core::QueryCache::configure({});    // 关闭缓存隔离
     core::InterceptorRegistry::clear();
@@ -209,9 +216,8 @@ static void test_non_redacted_caches_normally() {
     check(!rs2.transformed, "第二次读：rs.transformed=false");
     check(gMockQueryCount.load() == 1,
           "非脱敏读：driver 只调 1 次（缓存命中）");
-    // DataSource + Session（首次）+ DataSource（缓存命中） = ≥3
-    check(noop->afterCount.load() >= 3,
-          "afterExecution ≥3 次（DataSource + Session + 缓存命中 DataSource）");
+    check(noop->afterCount.load() == 2,
+          "每个公开 query 恰好执行一次 afterExecution");
 
     core::QueryCache::configure({});
     core::InterceptorRegistry::clear();
@@ -242,7 +248,7 @@ struct RedactionFlagInterceptor : public core::ISqlInterceptor {
 };
 
 static void test_transformed_flag_blocks_cache() {
-    std::cout << "== M7.3 transformed=true → cacheStore 守卫拦截==\n";
+    std::cout << "== M7.3 transformed=true 不污染原始缓存==\n";
     core::DatabaseManager mgr;
     config::DataSourceConfig ds;
     ds.name = "ds"; ds.type = "mockr"; ds.host = "localhost";
@@ -268,15 +274,14 @@ static void test_transformed_flag_blocks_cache() {
     // 首次：afterExecution 改写标记 1 次（仅 DataSource 层；Session 子语句未触发因它未到 driver）
     check(gTransformedReads.load() >= 1, "首次：afterExecution 改写标记 ≥1 次");
 
-    // 第二次：拦截器同样翻转 transformed → 缓存被守卫拦下 → driver 又调一次。
+    // 第二次从原始缓存复制结果，再执行当前请求的改写。
     common::ResultSet rs2;
     g->query("SELECT x", rs2);
     check(rs2.transformed, "二次：rs.transformed=true（再次脱敏）");
-    check(gMockQueryCount.load() == 2,
-          "二次：driver 又 1 次（I10 阻止 transformed=true 入缓存）");
-    // afterExecution 累计 ≥4 次：首次 DataSource+Session + 二次 DataSource+Session
-    check(gTransformedReads.load() >= 4,
-          "二次：afterExecution 改写标记累计 ≥4 次");
+    check(gMockQueryCount.load() == 1,
+          "二次：命中未改写的原始缓存");
+    check(gTransformedReads.load() == 2,
+          "二次：afterExecution 改写标记累计 2 次");
 
     core::QueryCache::configure({});
     core::InterceptorRegistry::clear();

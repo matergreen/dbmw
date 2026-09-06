@@ -20,6 +20,7 @@
 //
 // 无真实数据库依赖，全部走 mock 驱动。
 #include "dbmw/dbmw.h"
+#include "dbmw/common/context.h"
 #include "dbmw/core/connection_pool.h"
 #include "dbmw/core/database_manager.h"
 #include "dbmw/core/idatabase_connection.h"
@@ -532,6 +533,21 @@ int main() {
         check(st.ok(), "DBMW::addDataSource 成功");
         check(DBMW::dataSource("via_facade") != nullptr,
               "DBMW::dataSource(via_facade) 可见");
+
+        const auto routed = DBMW::dataSource("via_facade");
+        common::SqlContext routeContext;
+        routeContext.targetDataSource = "via_facade";
+        {
+            common::ContextScope scope(routeContext);
+            check(DBMW::dataSource() == routed && DBMW::dataSource("anchor") == routed,
+                  "SqlContext.targetDataSource 覆盖默认与显式 facade 路由");
+        }
+        check(DBMW::dataSource() != routed,
+              "ContextScope 退出后恢复默认数据源");
+
+        const auto removeDefault = DBMW::removeDataSource("anchor");
+        check(!removeDefault.ok() && removeDefault.code == common::ErrorCode::ConfigError,
+              "运行期拒绝删除当前默认数据源");
 
         // 重名拒绝。
         const auto dup = DBMW::addDataSource(mockLeafCfg("via_facade"));

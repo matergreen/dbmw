@@ -161,14 +161,16 @@ int main() {
                   bad),
               "spanId 含 z 拒绝");
 
-        // flags 错误不影响主字段有效性（设计上 flags 容许扩展）
+        // trace-flags 也是固定的两位十六进制字段。
         SqlContext withBadFlags;
-        check(parseTraceparent(
+        check(!parseTraceparent(
                   "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-zz",
                   withBadFlags),
-              "flags 非 hex 不影响 traceId/spanId 解析");
-        check(withBadFlags.traceId == "0af7651916cd43dd8448eb211c80319c",
-              "flags 错误时 traceId 仍被填充");
+              "flags 非 hex 时拒绝整个 traceparent");
+        check(!parseTraceparent(
+                  "00-0af7651916cd43dd8448eb211c80319c-0000000000000000-01",
+                  bad),
+              "全 0 span-id 拒绝");
     }
 
     std::cout << "== M1 上下文：formatTraceparent 与 parse 往返 ==\n";
@@ -191,12 +193,10 @@ int main() {
               roundTrip.spanId == ctx.spanId,
               "traceId/spanId 往返无损");
 
-        // spanId 长度不对时补 16 个 0
+        // 无效 spanId 不能输出一个看似合法但违反 W3C 约束的 header。
         ctx.spanId = "short";
-        const auto padded = formatTraceparent(ctx);
-        SqlContext parsed;
-        check(parseTraceparent(padded, parsed) && parsed.spanId == "0000000000000000",
-              "spanId 长度无效时占位 16 个 0");
+        check(formatTraceparent(ctx).empty(),
+              "spanId 长度无效时不生成 traceparent");
     }
 
     std::cout << "== M1 上下文：nextSpanId 形态与跨调用差异 ==\n";
@@ -214,7 +214,28 @@ int main() {
         check(isLowerHex16(second) && isLowerHex16(third),
               "连续两次输出也是 16 小写 hex");
         std::set<std::string> unique{first, second, third};
-        check(unique.size() == 3, "三次生成互不相同（线程内计数器递增）");
+        check(unique.size() == 3, "三次生成互不相同（进程级序列递增）");
+
+        constexpr std::size_t kThreads = 8;
+        constexpr std::size_t kPerThread = 128;
+        std::vector<std::vector<std::string>> generated(kThreads);
+        std::vector<std::thread> workers;
+        for (std::size_t t = 0; t < kThreads; ++t) {
+            workers.emplace_back([&, t] {
+                SqlContext workerCtx;
+                workerCtx.traceId = "0af7651916cd43dd8448eb211c80319c";
+                ContextScope workerScope(workerCtx);
+                generated[t].reserve(kPerThread);
+                for (std::size_t i = 0; i < kPerThread; ++i)
+                    generated[t].push_back(nextSpanId());
+            });
+        }
+        for (auto &worker : workers) worker.join();
+        std::set<std::string> all;
+        for (const auto &perThread : generated)
+            all.insert(perThread.begin(), perThread.end());
+        check(all.size() == kThreads * kPerThread,
+              "多线程生成的 spanId 不发生区间重叠");
     }
 
     std::cout << "\n----------------------------------------\n";

@@ -139,7 +139,8 @@ namespace dbmw
         //
         // 注册顺序即调用顺序。建议在 `init()` 之前调用——若在 `init()` 之后
         // 注册，已在执行的语句不会回头补钩。每条 SQL 触发 onRoute/before/
-        // after/onCompletion 四回调，由 `interceptors.enabled` 配置总开关。
+        // after/onCompletion；流式结果还会逐行触发 onRow。由
+        // `interceptors.enabled` 配置总开关。
         // 必须在进程级注册——不让数据源级屏蔽，因为 SPI 是横切关注点。
         // 也必须在被另一拦截器依赖的代码中**早于**该依赖注册，避免执行期间
         // 注册顺序与设计意图不一致。

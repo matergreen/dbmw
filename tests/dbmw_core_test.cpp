@@ -1620,6 +1620,30 @@ int main() {
                                                renderOptions, rendered).ok() &&
               rendered == "SELECT '1;DROP TABLE t'",
               "强类型诊断值经驱动转义，不会被当作原始 SQL 片段");
+
+        common::Timestamp utc;
+        common::Timestamp offset;
+        check(common::tryParseTimestamp("2000-01-01 00:00:00Z", utc) &&
+              std::chrono::duration_cast<std::chrono::seconds>(
+                  utc.time_since_epoch()).count() == 946684800,
+              "带 Z 的 timestamp 按 UTC 解析，不受本机时区影响");
+        check(common::tryParseTimestamp("2000-01-01 08:00:00.123456+08:00", offset) &&
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  offset.time_since_epoch()).count() == 946684800123456LL,
+              "带偏移的 timestamptz 正确归一化为绝对时间");
+        check(common::timestampToUtcStringMs(offset) == "2000-01-01 00:00:00.123+00",
+              "PostgreSQL 时间参数使用明确 UTC 文本，避免本机时区二次偏移");
+        check(!common::tryParseTimestamp("2026-02-30 12:00:00Z", utc) &&
+              !common::tryParseTimestamp("2026-01-01 12:00:00+25:00", utc),
+              "拒绝无效日历日期与非法时区偏移");
+
+        common::ResultSet reusable;
+        reusable.transformed = true;
+        reusable.setFields({"v"});
+        reusable.addRow(common::Row{});
+        reusable.clear();
+        check(!reusable.transformed && reusable.fields().empty() && reusable.empty(),
+              "ResultSet::clear 同时清除改写标记，复用对象不会继承旧状态");
     }
 
     std::cout << "\n----------------------------------------\n";

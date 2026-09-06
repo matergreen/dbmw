@@ -131,7 +131,7 @@
 | M4 | 动态数据源 | ✅ **已落地**（2026-09）——`addDataSource/removeDataSource/addGroup/removeGroup` + facade 透传 + 79 项单测。独立于 SPI，改动面集中在 `DatabaseManager::init` 的替换逻辑，宜早做以暴露生命周期问题 |
 | M5 | 幂等声明 | ✅ **已落地**（2026-09）——`context.h` 三态枚举 + 同步 `resolveWriteAttempts` + 异步 `maxAttempts` 接入 + 19 项单测。独立小改动，把重试语义从"引擎猜"变成"调用方声明" |
 | M6 | 影子库路由 | ✅ **已落地**（2026-09）——`DataSourceGroupConfig::shadow` 字段 + 同步 `readTarget/writeTargets/dispatchWrite/cacheEligible` 影子分支 + 异步 `entryCtx` 透传 + `resolveShadows` 4 项校验 + 39 项单测。复用 M1 SPI `onRoute` 触发，硬守住 I12（影子不进写缓冲）/ I10（影子不进缓存）；同步异步决策同源 |
-| M7 | 结果脱敏 | ✅ **已落地**（2026-09）——`ResultSet::transformed` 字段 + I10 守卫（cacheStore 内 `rows.transformed` 守卫 + queryUngated inline 守卫双层）+ 异步缓存命中路径补 afterExecution 修复 §9.4 风险行 + 38 项单测。完全依赖 SPI，零业务假设；改写规则由业务 MaskingInterceptor 提供 |
+| M7 | 结果脱敏 | ✅ **已落地**（2026-09）——普通查询使用 `afterExecution` + `mutableRows()`，`queryEach`/游标使用逐行 `onRow`；同步缓存只保存驱动原始结果，异步 `cacheStore` 拒绝 `transformed` 结果，缓存命中仍执行改写。完全依赖 SPI，规则由业务 MaskingInterceptor 提供 |
 | M8 | 读后写增强 | ✅ **已落地**（2026-09）——`SqlContext.wroteInThisRequest` 会话级粘性读 + `pinRequestWrite()` 在 leaf 写成功后置位栈顶 + `readTarget` 第 1 级判定 + `ConfigLoader` 副本+零窗口 WARN。3 级优先级：wIRT > 时间戳窗口 > 副本轮询；26 项单测覆盖同步 / 异步 / 帧隔离 / 影子 / 幂等正交 |
 | M9 | 观测延展（M6/M7 收尾）| ✅ **已落地**（2026-09）——`OperationEvent` 增加 `shadow` / `transformed` 两字段；emitSql 读栈顶 `SqlContext.shadow`，observeSql 透传 `ResultSet*` 读 `result->transformed`，同步异步共用 emitSql 一份注入路径；22 项单测 + 全库 543 项 0 失败。设计 §8.5 提到的"指标可观测性"补齐 |
 
@@ -793,16 +793,16 @@ if (!rs.transformed) cacheStore(key, rs);   // 脱敏结果不进缓存（I10）
 
 1. **`include/dbmw/common/types.h`**：`ResultSet` 追加 `bool transformed = false`（默认 false，I10 标记位）。业务 `ISqlInterceptor::afterExecution` 改写 `view.result` 后置位。
 2. **`src/core/database_manager.cpp`**：
-   - `queryUngated` 在 `!out.transformed` 时才 `QueryCache::put(...)`（同步路径守卫）；
+   - `queryUngated` 在顶层 `afterExecution` 前保存驱动原始结果，返回副本随后按请求改写；
    - `DataSource::cacheStore` 同样守卫（与已有 shadow 守卫并列）；
    - 同步路径的 runWithInterceptors 天然包住 queryUngated → 缓存命中也会发 afterExecution（无需额外改动）。
 3. **`src/async/async_engine.cpp`**：
    - 异步 `submitStatementOp` 缓存命中分支手动构造 `ExecutionView` 并调一次 `core::detail::runAfterExecution(view)`（§9.4 风险行：缓存命中漏脱敏修复）；
    - 写缓冲守卫、缓存守卫保留 `entryCtx.shadow` 守卫；新增逻辑不破坏 M6 的 I12 防御。
-4. **`tests/dbmw_redaction_test.cpp`**（新增）：38 项断言 / 5 个场景——
-   - 同步脱敏读不进缓存（I10 核心：driver 调 2 次，拦截器 afterExecution 至少 3 次覆盖 DataSource+Session+缓存命中 DataSource 三层）；
+4. **`tests/dbmw_redaction_test.cpp`**：覆盖普通/异步/缓存命中与流式逐行改写——
+   - 同步缓存保存原始结果，driver 调 1 次；每次返回都恰好执行一次 afterExecution；
    - 未脱敏读照常进缓存（I10 不误伤）；
-   - 同步 transformed 标记位真能阻塞 cacheStore 守卫（通过 query 路径两轮读验证）；
+   - `queryEach` 在业务回调前执行一次 `onRow`；
    - 异步路径 I10 同源（驱动 2 次 + afterExecution ≥2）；
    - **§9.4 修复验证**：异步缓存命中仍调 afterExecution（驱动仍 1 次 + 拦截器调 1 次 + transformed 标记位翻转）。
 
@@ -810,9 +810,9 @@ if (!rs.transformed) cacheStore(key, rs);   // 脱敏结果不进缓存（I10）
 
 | 不变量 | 实现位置 |
 | --- | --- |
-| **I10 脱敏结果绝不进缓存** | `cacheStore` 内 `rows.transformed` 守卫 + `queryUngated` 的 inline `QueryCache::put` 守卫双层；同步异步决策同源 |
+| **I10 脱敏结果绝不进缓存** | 同步路径先缓存原始结果再改写返回副本；异步 `cacheStore` 拒绝 `rows.transformed` |
 | 缓存命中路径仍走 afterExecution | 同步由 runWithInterceptors 包住；异步在 submit 时手动调 `detail::runAfterExecution` |
-| 业务改写 cell 的方式灵活 | dbmw 不替业务做合规决策；只提供标记 + 守卫，业务自行实现 MaskingInterceptor |
+| 业务改写 cell 的方式灵活 | 普通结果用 `mutableRows()`，流式结果用 `onRow`；业务自行实现 MaskingInterceptor |
 
 **未做（刻意）**：
 
@@ -990,4 +990,3 @@ M1 的 `ISqlInterceptor::onRoute` 回调**仍然保留**——它是一个**通�
 | `src/async/async_engine.cpp` | Op 携带 `SqlContext`；worker 安装 `ContextScope`；幂等声明接入重试判定 |
 | `src/dbmw.cpp` | `addInterceptor`；门面暴露新方法 |
 | `CMakeLists.txt` | 纳管新文件 |
-

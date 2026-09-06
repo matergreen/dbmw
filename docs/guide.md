@@ -827,11 +827,16 @@ public:
     void afterExecution(const dbmw::core::ExecutionView &view) override {
         if (!view.result) return;                  // 非查询（写 / 批 / 游标）不动
         // 这里做你的脱敏：按列名 / 列下标 / 值模式识别敏感字段并掩码
-        for (auto &row : view.result->rows()) {
-            // ... row.data() 遍历每个 cell，按合规策略替换 ...
+        for (auto &row : view.result->mutableRows()) {
+            // 示例：row.set("phone", "***");
         }
         // 关键：标记已被改写。中间件会守卫这一结果不进查询缓存。
         view.result->transformed = true;
+    }
+
+    void onRow(const dbmw::core::ExecutionView&, dbmw::common::Row &row) override {
+        // queryEach / 游标不会整体物化 ResultSet，逐行交付前在这里脱敏。
+        if (row.has("phone")) row.set("phone", "***");
     }
 
     void onCompletion(const dbmw::core::ExecutionView&) override {}
@@ -842,11 +847,11 @@ dbmw::DBMW::addInterceptor(std::make_shared<MaskingInterceptor>());
 dbmw::core::InterceptorRegistry::setEnabled(true);
 ```
 
-**I10 守卫的硬约束**：置位 `transformed=true` 后，dbmw 在三处硬拦截入缓存：
+**I10 守卫的硬约束**：同步查询先缓存驱动原始结果，再对返回副本执行 `afterExecution`；异步缓存入口通过 `transformed` 标记拒绝改写结果：
 
 | 位置 | 守卫 |
 |---|---|
-| `DataSource::queryUngated`（同步） | `if (caching && !out.transformed) QueryCache::put(...)` |
+| `DataSource::queryUngated`（同步） | 在顶层 `afterExecution` 之前保存原始结果 |
 | `DataSource::cacheStore`（同步） | `if (rows.transformed) return;` |
 | `async::query` 的 `step2Statement`（异步） | `if (policy.cacheable && !ctx->entryCtx.shadow) target->cacheStore(...)` ——`cacheStore` 内部守卫命中 |
 
@@ -854,10 +859,7 @@ dbmw::core::InterceptorRegistry::setEnabled(true);
 
 **缓存命中路径仍要走 `afterExecution`**（§9.4 风险行）：缓存里是原始数据（被守卫拦下，不可能有 transformed=true 的版本），所以缓存命中后必须重新跑一遍 `afterExecution` 才能得到当前用户的视图。同步路径天然被 `runWithInterceptors` 包住；异步路径在 submit 时手动构造视图调一次 `detail::runAfterExecution(view)`。
 
-**业务改写 `ResultSet` 的限制**：`rows()` / `row.data()` 当前返回 `const &`，不可原地改写 cell。如需掩码：
-
-- 业务在自己的拦截器里缓存原始 `Row.data()` 索引，按列名读 + 写自己的 `map<string, Value>`；
-- 或 dbmw 提供 `ResultSet::transformRow(name, fn)` 之类的可变入口（M7 仅落地标记 + 守卫，没扩 API 面）。
+普通查询使用 `mutableRows()` 原地改写；`queryEach` 与游标使用 `onRow`，中间件不会为了脱敏把流式结果整体物化。
 
 不变量保留：**数据进入拦截器 → 数据出拦截器 → 缓存守卫**全程只看 `transformed` 标记位。详细行为与代码片段见 `tests/dbmw_redaction_test.cpp`（38 项断言，5 个场景覆盖同步 / 异步 / 缓存命中 / I10 守卫 / 改写标记）。
 

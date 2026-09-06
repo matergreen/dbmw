@@ -26,18 +26,16 @@ namespace dbmw::core {
             return r;
         }
 
-        // 递归深度：> 1 表示当前已在拦截器自身引出的子调用中。
-        // 拦截器内再触发的 SQL 不应被分发。
-        std::atomic<std::size_t> &interceptorDepth() {
-            static std::atomic<std::size_t> d{0};
-            return d;
-        }
+        // 执行嵌套与回调递归都必须按线程隔离。进程级原子会让一个线程的
+        // 拦截器回调错误抑制另一个线程的正常 SQL。
+        thread_local std::size_t g_executionDepth = 0;
+        thread_local std::size_t g_callbackDepth = 0;
 
         // 一次性递增/递减 RAII 助手，便于埋点路径使用对称的进出栈。
-        class DepthGuard {
+        class CallbackGuard {
         public:
-            DepthGuard() noexcept { interceptorDepth().fetch_add(1); }
-            ~DepthGuard() noexcept { interceptorDepth().fetch_sub(1); }
+            CallbackGuard() noexcept { ++g_callbackDepth; }
+            ~CallbackGuard() noexcept { --g_callbackDepth; }
         };
 
         // 单次拦截器调用的异常吞掉包装（I11）。
@@ -96,13 +94,26 @@ namespace dbmw::core {
 // 此处签名不对外暴露；真正消费方会在 database_manager.cpp 内的匿名命名空间
 // 提供一个 `runInterceptorsXXX(...)` 函数调用本类，把字面量包装集中起来。
 
-    detail::InterceptorGuard::~InterceptorGuard() {
-        if (!InterceptorRegistry::enabled()) return;
-        // 递归保护：拦截器自身调 SQL 时不再回调——避免无限递归。
-        if (interceptorDepth().load(std::memory_order_relaxed) > 1) return;
-        for (auto &it : InterceptorRegistry::snapshot()) {
-            safeCall([&]{ it->onCompletion(view_); });
+    detail::InterceptorGuard::InterceptorGuard(const ExecutionView &view)
+        : view_(view),
+          active_(InterceptorRegistry::enabled() && g_executionDepth == 0 &&
+                  g_callbackDepth == 0) {
+        if (active_) ++g_executionDepth;
+    }
+
+    detail::InterceptorGuard::~InterceptorGuard() noexcept {
+        if (active_) {
+            CallbackGuard callbackGuard;
+            try {
+                for (auto &it : InterceptorRegistry::snapshot()) {
+                    safeCall([&]{ it->onCompletion(view_); });
+                }
+            } catch (...) {
+                // snapshot() 的分配失败也不能从析构函数逃逸；埋点永远不能
+                // 改变业务异常路径。
+            }
         }
+        if (active_) --g_executionDepth;
     }
 
     // 命令式助手（被埋点调用），用 C++17 free function 导出。
@@ -111,17 +122,18 @@ namespace dbmw::core {
 
         void runOnRoute(const std::string &dataSource, const std::string &sql,
                         common::OperationType type, common::SqlContext &ctx) {
-            if (!InterceptorRegistry::enabled()) return;
-            // 路由阶段不计入 depth：路由本身不分发执行，没有递归风险。
+            if (!InterceptorRegistry::enabled() || g_executionDepth > 0 ||
+                g_callbackDepth > 0) return;
+            CallbackGuard callbackGuard;
             for (auto &it : InterceptorRegistry::snapshot()) {
                 safeCall([&]{ it->onRoute(dataSource, sql, type, ctx); });
             }
         }
 
         common::Status runBeforeExecution(const ExecutionView &view) {
-            if (!InterceptorRegistry::enabled()) return common::Status::OK();
-            DepthGuard dg;
-            if (interceptorDepth().load(std::memory_order_relaxed) > 1) return common::Status::OK();
+            if (!InterceptorRegistry::enabled() || g_executionDepth > 1 ||
+                g_callbackDepth > 0) return common::Status::OK();
+            CallbackGuard callbackGuard;
             common::Status st;
             for (auto &it : InterceptorRegistry::snapshot()) {
                 safeCall([&]{ st = it->beforeExecution(view); });
@@ -132,9 +144,20 @@ namespace dbmw::core {
         }
 
         void runAfterExecution(const ExecutionView &view) {
-            if (!InterceptorRegistry::enabled()) return;
+            if (!InterceptorRegistry::enabled() || g_executionDepth > 1 ||
+                g_callbackDepth > 0) return;
+            CallbackGuard callbackGuard;
             for (auto &it : InterceptorRegistry::snapshot()) {
                 safeCall([&]{ it->afterExecution(view); });
+            }
+        }
+
+        void runOnRow(const ExecutionView &view, common::Row &row) {
+            if (!InterceptorRegistry::enabled() || g_executionDepth > 1 ||
+                g_callbackDepth > 0) return;
+            CallbackGuard callbackGuard;
+            for (auto &it : InterceptorRegistry::snapshot()) {
+                safeCall([&]{ it->onRow(view, row); });
             }
         }
 
@@ -146,7 +169,7 @@ namespace dbmw::core {
 
         // 当前递归深度（仅供调试，调用方勿用以改变业务行为）。
         std::size_t currentInterceptorDepth() noexcept {
-            return interceptorDepth().load(std::memory_order_relaxed);
+            return g_executionDepth + g_callbackDepth;
         }
 
     } // namespace detail

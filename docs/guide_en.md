@@ -780,12 +780,17 @@ public:
     void afterExecution(const dbmw::core::ExecutionView &view) override {
         if (!view.result) return;                  // not a query (write / batch / cursor) — skip
         // Your masking logic: detect sensitive fields by column name / index / value pattern
-        for (auto &row : view.result->rows()) {
-            // ... iterate row.data() and replace values per compliance rules ...
+        for (auto &row : view.result->mutableRows()) {
+            // Example: row.set("phone", "***");
         }
         // Critical: signal that the row has been rewritten. The framework will
         // hard-block this result from entering the query cache.
         view.result->transformed = true;
+    }
+
+    void onRow(const dbmw::core::ExecutionView&, dbmw::common::Row &row) override {
+        // queryEach/cursors do not materialize a full ResultSet; mask before delivery.
+        if (row.has("phone")) row.set("phone", "***");
     }
 
     void onCompletion(const dbmw::core::ExecutionView&) override {}
@@ -796,11 +801,11 @@ dbmw::DBMW::addInterceptor(std::make_shared<MaskingInterceptor>());
 dbmw::core::InterceptorRegistry::setEnabled(true);
 ```
 
-**The I10 guard's hard constraint**: after `transformed = true`, dbmw blocks the result from the cache in three places:
+**The I10 guard's hard constraint**: synchronous queries cache the driver's raw result before applying `afterExecution` to the returned copy; asynchronous cache insertion rejects transformed results:
 
 | Location | Guard |
 |---|---|
-| `DataSource::queryUngated` (sync) | `if (caching && !out.transformed) QueryCache::put(...)` |
+| `DataSource::queryUngated` (sync) | stores the raw result before top-level `afterExecution` |
 | `DataSource::cacheStore` (sync) | `if (rows.transformed) return;` |
 | `async::query`'s `step2Statement` (async) | `if (policy.cacheable && !ctx->entryCtx.shadow) target->cacheStore(...)` — the inner `cacheStore` runs the guard |
 
@@ -808,10 +813,7 @@ dbmw::core::InterceptorRegistry::setEnabled(true);
 
 **The cache-hit path still has to run `afterExecution`** (§9.4 risk row): the cache stores raw data (the guard ensures no `transformed=true` entry ever lands there), so a cache hit must still re-run `afterExecution` to produce the *current* user's view. Sync paths are wrapped by `runWithInterceptors`; async submit constructs a view manually and calls `detail::runAfterExecution(view)` once.
 
-**Constraint on mutating `ResultSet`**: `rows()` and `row.data()` currently return `const &`, so cells can't be rewritten in place. To mask, either:
-
-- cache the raw `Row.data()` index in your interceptor and read by column name, writing to your own `map<string, Value>`;
-- or wait for dbmw to expose a `ResultSet::transformRow(name, fn)` mutable entry point (M7 only ships the flag + the guard, no API surface expansion).
+Use `mutableRows()` to rewrite regular query results. Implement `onRow` for `queryEach` and cursors; dbmw does not materialize the entire stream just to apply redaction.
 
 Preserved invariant: **data in interceptor → data out interceptor → cache guard** all hinges solely on the `transformed` flag. See `tests/dbmw_redaction_test.cpp` for the full behavior matrix (38 assertions across 5 scenarios covering sync / async / cache hit / I10 guard / redaction flag).
 

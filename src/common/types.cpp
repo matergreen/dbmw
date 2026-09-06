@@ -81,23 +81,23 @@ namespace dbmw::common {
 
     namespace {
         // 把 time_point 拆成 civil time；秒以下单独由 fracNs 返回。
-        std::tm toLocalTm(const Timestamp &t, long long &fracNs) {
+        std::tm toTm(const Timestamp &t, long long &fracNs, const bool utc) {
             const auto secs = std::chrono::floor<std::chrono::seconds>(t.time_since_epoch());
             fracNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
                          t.time_since_epoch() - secs).count();
             const auto tt = static_cast<std::time_t>(secs.count());
             std::tm tm{};
 #if defined(_WIN32)
-            localtime_s(&tm, &tt);
+            if (utc) gmtime_s(&tm, &tt); else localtime_s(&tm, &tt);
 #else
-            localtime_r(&tt, &tm);
+            if (utc) gmtime_r(&tt, &tm); else localtime_r(&tt, &tm);
 #endif
             return tm;
         }
 
-        std::string formatTimestamp(const Timestamp &t, bool withMillis) {
+        std::string formatTimestamp(const Timestamp &t, bool withMillis, bool utc = false) {
             long long fracNs = 0;
-            const std::tm tm = toLocalTm(t, fracNs);
+            const std::tm tm = toTm(t, fracNs, utc);
             char buf[32] = {0};
             std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
             std::string s(buf);
@@ -125,6 +125,10 @@ namespace dbmw::common {
 
     std::string timestampToStringMs(const Timestamp &t) {
         return formatTimestamp(t, true);
+    }
+
+    std::string timestampToUtcStringMs(const Timestamp &t) {
+        return formatTimestamp(t, true, true) + "+00";
     }
 
     bool tryParseTimestamp(const std::string &s, Timestamp &out) {
@@ -175,9 +179,54 @@ namespace dbmw::common {
             fracNs = v;
         }
 
-        if (mo < 1 || mo > 12 || d < 1 || d > 31 || h < 0 || h > 23 ||
-            mi < 0 || mi > 59 || se < 0 || se > 60 || y < 1900) {
+        bool hasExplicitZone = false;
+        int offsetSeconds = 0;
+        if (i < s.size()) {
+            if (s[i] == 'Z' || s[i] == 'z') {
+                hasExplicitZone = true;
+                ++i;
+            } else if (s[i] == '+' || s[i] == '-') {
+                hasExplicitZone = true;
+                const int sign = s[i++] == '+' ? 1 : -1;
+                int oh = 0, om = 0;
+                if (!readInt(i, 2, oh)) return false;
+                if (i < s.size() && s[i] == ':') ++i;
+                if (i < s.size() && !readInt(i, 2, om)) return false;
+                if (oh > 23 || om > 59) return false;
+                offsetSeconds = sign * (oh * 3600 + om * 60);
+            }
+        }
+        if (i != s.size()) return false;
+
+        const auto leap = [](int year) {
+            return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        };
+        static constexpr int monthDays[] = {31, 28, 31, 30, 31, 30,
+                                             31, 31, 30, 31, 30, 31};
+        if (mo < 1 || mo > 12 || d < 1 ||
+            d > monthDays[mo - 1] + (mo == 2 && leap(y) ? 1 : 0) ||
+            h < 0 || h > 23 || mi < 0 || mi > 59 || se < 0 || se > 59 || y < 1900) {
             return false;
+        }
+
+        if (hasExplicitZone) {
+            // Gregorian civil date -> days since 1970-01-01（Howard Hinnant 算法）。
+            int civilYear = y;
+            const unsigned civilMonth = static_cast<unsigned>(mo);
+            civilYear -= civilMonth <= 2;
+            const int era = (civilYear >= 0 ? civilYear : civilYear - 399) / 400;
+            const unsigned yoe = static_cast<unsigned>(civilYear - era * 400);
+            const unsigned shiftedMonth = civilMonth > 2 ? civilMonth - 3 : civilMonth + 9;
+            const unsigned doy = (153 * shiftedMonth + 2) / 5
+                                 + static_cast<unsigned>(d) - 1;
+            const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            const std::int64_t days = static_cast<std::int64_t>(era) * 146097
+                                      + static_cast<std::int64_t>(doe) - 719468;
+            const std::int64_t seconds = days * 86400 + h * 3600 + mi * 60 + se
+                                         - offsetSeconds;
+            out = Timestamp{} + std::chrono::duration_cast<Timestamp::duration>(
+                      std::chrono::seconds(seconds) + std::chrono::nanoseconds(fracNs));
+            return true;
         }
 
         std::tm tm{};

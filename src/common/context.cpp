@@ -1,5 +1,6 @@
 #include "dbmw/common/context.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -94,19 +95,18 @@ namespace dbmw::common {
     // nextSpanId
     // ------------------------------------------------------------------------
     //
-    // 用 thread_local 计数器 + 进程级随机化种子生成 64-bit 数，再写成 16 hex。
-    // 与格式无关——只要"足够分散"避免 spanId 撞车即可。
+    // 用进程级原子序列生成 64-bit 数，再写成 16 hex。所有线程从同一序列
+    // 领取编号，避免各线程局部计数区间重叠。
     // 真正生产环境应使用 OpenTelemetry 的 spanId 随机实现（M3 集成时再升级）。
     std::string nextSpanId() {
         const auto &ctx = ContextScope::current();
         if (ctx.traceId.empty() && ctx.spanId.empty()) {
             return {}; // 无业务上下文时不发"幽灵 span"
         }
-        // 进程级原子种子 + thread_local 计数器
+        // 每个 span 都从同一个进程级序列领取唯一编号。旧实现只给每个线程
+        // 分配相邻的起点，线程 A 的第 2 个值会与线程 B 的第 1 个值碰撞。
         static std::atomic<std::uint64_t> globalSeq{0};
-        static thread_local std::uint64_t base =
-            globalSeq.fetch_add(1, std::memory_order_relaxed);
-        std::uint64_t seq = ++base;
+        std::uint64_t seq = globalSeq.fetch_add(1, std::memory_order_relaxed) + 1;
         std::array<char, 16> buf{};
         for (int i = 15; i >= 0; --i) {
             buf[i] = kHex[seq & 0x0F];
@@ -133,15 +133,21 @@ namespace dbmw::common {
         SqlContext tmp;
         if (!copyHex(header, 3, 32, tmp.traceId)) return false;
         if (!copyHex(header, 36, 16, tmp.spanId)) return false;
-        // flags：放在 53..54，按 W3C 应是 2 hex 但协议层容许扩展；
-        // 我们不做格式校验，也不会写回任何字段（解析时直接丢弃）。
-        // 注意：flags 单独解析；不能写入 tmp.traceId（会覆盖 traceId 字段）！
+        // flags：当前版本固定为两个十六进制字符。未知位可以保留，但格式
+        // 仍必须合法；否则会把损坏的传播头当成可信 trace。
         std::string flagsBuf;
-        (void)copyHex(header, 53, 2, flagsBuf);
+        if (!copyHex(header, 53, 2, flagsBuf)) return false;
 
         // W3C 明确禁止全 0 trace-id。
         bool allZero = true;
         for (char c : tmp.traceId) {
+            if (c != '0') { allZero = false; break; }
+        }
+        if (allZero) return false;
+
+        // W3C 同样禁止全 0 parent-id。
+        allZero = true;
+        for (char c : tmp.spanId) {
             if (c != '0') { allZero = false; break; }
         }
         if (allZero) return false;
@@ -151,17 +157,17 @@ namespace dbmw::common {
     }
 
     std::string formatTraceparent(const SqlContext &ctx) {
-        if (ctx.traceId.empty()) return {};
+        if (ctx.traceId.size() != 32 || ctx.spanId.size() != 16) return {};
+        if (!std::all_of(ctx.traceId.begin(), ctx.traceId.end(), isHex) ||
+            !std::all_of(ctx.spanId.begin(), ctx.spanId.end(), isHex)) return {};
+        if (std::all_of(ctx.traceId.begin(), ctx.traceId.end(), [](char c) { return c == '0'; }) ||
+            std::all_of(ctx.spanId.begin(), ctx.spanId.end(), [](char c) { return c == '0'; })) return {};
         std::string out;
         out.reserve(55);
         out.append("00-");
         out.append(ctx.traceId);                  // 32 hex
         out.append("-");
-        if (ctx.spanId.size() == 16) {
-            out.append(ctx.spanId);
-        } else {
-            out.append(16, '0');                   // "非子跨度"占位
-        }
+        out.append(ctx.spanId);
         out.append("-01");                         // sampled
         return out;
     }

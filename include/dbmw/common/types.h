@@ -83,14 +83,19 @@ namespace dbmw::common {
 
         void addRow(Row row) { rows_.push_back(std::move(row)); }
         [[nodiscard]] const std::vector<Row> &rows() const { return rows_; }
+        // 供结果改写拦截器使用；调用方修改后应置 transformed=true。
+        [[nodiscard]] std::vector<Row> &mutableRows() { return rows_; }
         [[nodiscard]] size_t rowCount() const { return rows_.size(); }
         [[nodiscard]] bool empty() const { return rows_.empty(); }
-        void clear() { fields_.clear(); rows_.clear(); }
+        void clear() {
+            fields_.clear();
+            rows_.clear();
+            transformed = false;
+        }
 
-        // M7（§9.2 + I10）：SPI afterExecution 改写结果后置位。命中后
-        // 路由层 cacheStore 硬拦截——脱敏是角色/租户相关视图，把脱敏
-        // 结果写进缓存会让下一个不同权限的用户读到上一个的视图，
-        // 构成跨用户数据泄漏。默认 false，业务/合规拦截器置 true。
+        // SPI afterExecution 改写结果后置位。查询缓存只保存驱动原始结果，
+        // 命中后再按当前请求执行改写，避免角色/租户视图跨请求污染。
+        // cacheStore 等接受外部 ResultSet 的入口仍会拒绝 transformed=true。
         bool transformed = false;
 
     private:
@@ -281,6 +286,9 @@ namespace dbmw::common {
 
     // 时间点 -> 带毫秒的形式（用于 SQL 字面量，精度更高）。
     std::string timestampToStringMs(const Timestamp &t);
+
+    // UTC 版本，专用于具备绝对时间语义的 timestamptz 等类型。
+    std::string timestampToUtcStringMs(const Timestamp &t);
 
     // 尝试解析 "YYYY-MM-DD[ HH:MM:SS[.fff]]" 形式的时间字符串。
     // 解析失败返回 false，调用方应回退为字符串形式，避免丢数据。

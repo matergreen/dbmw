@@ -124,7 +124,11 @@ namespace dbmw::common {
         static void setPoolMetricsObserver(PoolMetricsObserver observer);
         // 注入"如何采"：由 DatabaseManager 在 init() 注入，回调里调用
         // mgr.allPoolStats()。未注入时 samplePoolMetrics() 返回空事件但不调观察者。
-        static void setPoolMetricsCollector(PoolMetricsCollector collector);
+        static void setPoolMetricsCollector(PoolMetricsCollector collector,
+                                            const void *owner = nullptr);
+        // 仅当槽位仍由 owner 注册时清空，避免旧 DatabaseManager shutdown
+        // 把后来实例安装的采集器一并移除。
+        static void clearPoolMetricsCollector(const void *owner);
         // 立即采一次并送进观察者。供采集器按需拉取，不必等周期。空 collector 时静默。
         static PoolMetricsEvent samplePoolMetrics() noexcept;
 

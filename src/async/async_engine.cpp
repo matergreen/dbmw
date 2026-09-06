@@ -412,7 +412,7 @@ namespace dbmw::async {
                 }
 
                 // M6（§8.2 + §8.3）：异步路径下路由决策也在调用线程做——
-                // 调用 onRoute 拿到带 shadow/targetDataSource 的 routeCtx，
+                // 调用 onRoute 拿到带 shadow 等标记的 routeCtx，
                 // 围绕后续 readTarget/writeTargets 计算压栈，让路由层读到。
                 // routeCtx 同时作为 entryCtx 喂给 worker（attemptFn 内的 Session
                 // 子语句与 I12 写缓冲守卫都靠它识别影子流量）。

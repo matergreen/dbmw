@@ -36,7 +36,7 @@ namespace dbmw::core {
         common::Status status;
         bool cached = false;
         std::size_t depth = 0;              // 0 = 业务顶层调用
-        common::SqlContext &ctx;            // 可写：路由期可置 shadow/targetDataSource
+        common::SqlContext &ctx;            // 可写：路由期可置 shadow/追踪等上下文字段
     };
 
     // SQL 执行扩展点。
@@ -45,6 +45,7 @@ namespace dbmw::core {
     //   - `onRoute`：preGate 之后、选节点之前（路由决策 + 上下文标记）；
     //   - `beforeExecution`：驱动调用之前（返回非 ok → 中止执行，不进重试/写缓冲）；
     //   - `afterExecution`：驱动调用之后（可改写 view.result——M7 脱敏即此）；
+    //   - `onRow`：queryEach/游标把一行交给业务之前（可原地脱敏）；
     //   - `onCompletion`：恰好一次（由 InterceptorGuard RAII 保证）。
     //
     // 线程模型：所有回调都在"执行此次 SQL"的同一线程上——
@@ -59,7 +60,8 @@ namespace dbmw::core {
         virtual ~ISqlInterceptor() = default;
 
         // 路由决策：preGate 之后、选节点之前。
-        // 可写 ctx（如置 shadow = true 把流量引到影子库，或填 targetDataSource）。
+        // 可写 ctx（如置 shadow = true 把流量引到影子库）。targetDataSource
+        // 应在调用 DBMW facade 前由业务 ContextScope 提供，当前调用才能换根数据源。
         virtual void onRoute(const std::string &dataSource, const std::string &sql,
                              common::OperationType type, common::SqlContext &ctx) = 0;
 
@@ -69,6 +71,10 @@ namespace dbmw::core {
 
         // 执行后：可改写 view.result（M7 脱敏即在此实现）。
         virtual void afterExecution(const ExecutionView &view) = 0;
+
+        // 流式结果逐行交付前：可原地改写 row。默认空实现保持已有拦截器
+        // 源码兼容；需要覆盖 queryEach/游标脱敏的实现应重写此方法。
+        virtual void onRow(const ExecutionView &, common::Row &) {}
 
         // 收尾：无论成功失败恰好调用一次（由 RAII 保证）。
         virtual void onCompletion(const ExecutionView &view) = 0;
@@ -111,6 +117,7 @@ namespace dbmw::core {
                         common::OperationType type, common::SqlContext &ctx);
         common::Status runBeforeExecution(const ExecutionView &view);
         void runAfterExecution(const ExecutionView &view);
+        void runOnRow(const ExecutionView &view, common::Row &row);
 
         // RAII 助手：构造时启动埋点计时/状态机，析构时触发 onCompletion 一次。
         // 定义放到头文件——调用方需要 `auto guard = makeInterceptorGuard(view)`
@@ -118,15 +125,17 @@ namespace dbmw::core {
         // 实现细节（onCompletion 的分发）放 interceptor.cpp，不放进头文件。
         class InterceptorGuard {
         public:
-            explicit InterceptorGuard(const ExecutionView &view) : view_(view) {}
-            ~InterceptorGuard();
+            explicit InterceptorGuard(const ExecutionView &view);
+            ~InterceptorGuard() noexcept;
             // 非可拷贝 / 非可移动：守 "onCompletion 恰好一次" 的不变量。
             InterceptorGuard(const InterceptorGuard &) = delete;
             InterceptorGuard &operator=(const InterceptorGuard &) = delete;
             InterceptorGuard(InterceptorGuard &&) = delete;
             InterceptorGuard &operator=(InterceptorGuard &&) = delete;
+            [[nodiscard]] bool active() const noexcept { return active_; }
         private:
             const ExecutionView &view_;
+            bool active_ = false;
         };
 
         InterceptorGuard makeInterceptorGuard(const ExecutionView &view);

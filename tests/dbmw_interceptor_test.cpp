@@ -8,9 +8,12 @@
 #include "dbmw/common/context.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace dbmw;
@@ -76,6 +79,38 @@ struct ThrowingInterceptor : public ISqlInterceptor {
     void onCompletion(const ExecutionView &) override {
         throw std::runtime_error("onCompletion boom");
     }
+};
+
+struct ConcurrentInterceptor : public ISqlInterceptor {
+    std::atomic<int> beforeCount{0};
+    std::atomic<int> completionCount{0};
+    std::mutex mutex;
+    std::condition_variable cv;
+
+    void onRoute(const std::string &, const std::string &,
+                 common::OperationType, common::SqlContext &) override {}
+    common::Status beforeExecution(const ExecutionView &) override {
+        ++beforeCount;
+        cv.notify_all();
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait_for(lock, std::chrono::seconds(1), [&] { return beforeCount.load() == 2; });
+        return common::Status::OK();
+    }
+    void afterExecution(const ExecutionView &) override {}
+    void onCompletion(const ExecutionView &) override { ++completionCount; }
+};
+
+struct ReentrantRouteInterceptor : public ISqlInterceptor {
+    std::atomic<int> routeCount{0};
+    void onRoute(const std::string &ds, const std::string &sql,
+                 common::OperationType type, common::SqlContext &ctx) override {
+        if (++routeCount == 1) detail::runOnRoute(ds, sql, type, ctx);
+    }
+    common::Status beforeExecution(const ExecutionView &) override {
+        return common::Status::OK();
+    }
+    void afterExecution(const ExecutionView &) override {}
+    void onCompletion(const ExecutionView &) override {}
 };
 
 int main() {
@@ -265,7 +300,7 @@ int main() {
     std::cout << "== M1 SPI：currentInterceptorDepth 用于诊断 ==\n";
     {
         // 顶层调用时 depth = 0；嵌套 SQL（被拦截器触发）应涨，退出后归零。
-        // runBeforeExecution 内部使用 DepthGuard 进出各一次。
+        // runBeforeExecution 内部使用线程局部回调深度，退出后应归零。
         InterceptorRegistry::clear();
         InterceptorRegistry::setEnabled(true);
         const auto beforeLevel = detail::currentInterceptorDepth();
@@ -277,6 +312,42 @@ int main() {
         const auto afterLevel = detail::currentInterceptorDepth();
         check(beforeLevel == 0 && afterLevel == 0,
               "进 runBeforeExecution 前后 depth 均为 0（DepthGuard 退出时已归零）");
+        InterceptorRegistry::setEnabled(false);
+        InterceptorRegistry::clear();
+    }
+
+    std::cout << "== M1 SPI：递归与并发隔离 ==\n";
+    {
+        InterceptorRegistry::clear();
+        InterceptorRegistry::setEnabled(true);
+        auto reentrant = std::make_shared<ReentrantRouteInterceptor>();
+        InterceptorRegistry::add(reentrant);
+        SqlContext routeContext;
+        detail::runOnRoute("ds-route", "SELECT recursive", OperationType::Query,
+                           routeContext);
+        check(reentrant->routeCount.load() == 1,
+              "onRoute 内再次触发路由时被递归保护拦截");
+
+        InterceptorRegistry::clear();
+        auto concurrent = std::make_shared<ConcurrentInterceptor>();
+        InterceptorRegistry::add(concurrent);
+        auto run = [&](const std::string &sql) {
+            SqlContext ctx;
+            ExecutionView view{"ds-concurrent", sql, OperationType::Query,
+                               nullptr, nullptr, 0, std::chrono::microseconds{0},
+                               Status::OK(), false, 0, ctx};
+            auto guard = detail::makeInterceptorGuard(view);
+            detail::runBeforeExecution(view);
+        };
+        std::thread first(run, "SELECT first");
+        std::thread second(run, "SELECT second");
+        first.join();
+        second.join();
+        check(concurrent->beforeCount.load() == 2,
+              "两个线程的拦截深度互不抑制");
+        check(concurrent->completionCount.load() == 2,
+              "两个并发顶层调用各完成一次 onCompletion");
+
         InterceptorRegistry::setEnabled(false);
         InterceptorRegistry::clear();
     }

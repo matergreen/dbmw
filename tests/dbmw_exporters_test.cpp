@@ -248,6 +248,10 @@ int main() {
               "slow_sql_count = 7");
         check(contains(text, R"(dbmw_slow_sql_count{data_source="ds-app",fingerprint="67890"} 2)"),
               "第二条 slow_sql_count = 2");
+        check(contains(text, "# TYPE dbmw_slow_sql_duration_seconds histogram"),
+              "duration 使用标准 Prometheus histogram family");
+        check(contains(text, R"(dbmw_slow_sql_duration_seconds_count{data_source="ds-app",fingerprint="12345"} 7)"),
+              "histogram family 包含 _count 样本");
 
         // histogram bucket：第一个 fingerprint 在 10ms=0, 100ms=7（全部命中），最后 +Inf=7
         check(contains(text, R"(dbmw_slow_sql_duration_seconds_bucket{data_source="ds-app",fingerprint="12345",le="0.01"} 0)"),

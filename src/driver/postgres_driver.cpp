@@ -231,7 +231,7 @@ namespace dbmw::driver {
                 } else if (const auto *x = std::get_if<common::Decimal>(&v)) {
                     p.append(std::optional<std::string>{x->value});
                 } else if (const auto *x = std::get_if<common::Timestamp>(&v)) {
-                    p.append(std::optional<std::string>{common::timestampToStringMs(*x)});
+                    p.append(std::optional<std::string>{common::timestampToUtcStringMs(*x)});
                 } else if (const auto *x = std::get_if<common::Date>(&v)) {
                     p.append(std::optional<std::string>{x->value});
                 } else if (const auto *x = std::get_if<common::Time>(&v)) {

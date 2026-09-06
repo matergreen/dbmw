@@ -1,5 +1,6 @@
 #include "dbmw/dbmw.h"
 #include "dbmw/async/dbmw_async.h"
+#include "dbmw/common/context.h"
 #include "dbmw/config/config_loader.h"
 
 #include <chrono>
@@ -24,11 +25,17 @@ namespace dbmw {
                                          "no default datasource");
         }
 
-        // 解析目标数据源：name 为空取默认，否则按名查找。
+        std::string effectiveDataSourceName(const std::string &name) {
+            const auto &target = common::ContextScope::current().targetDataSource;
+            return target.empty() ? name : target;
+        }
+
+        // 解析目标数据源：上下文显式路由优先；否则 name 为空取默认，非空按名查找。
         common::Status resolve(const std::string &name, std::shared_ptr<core::DataSource> &out) {
-            out = name.empty() ? mgr().getDefault() : mgr().getDataSource(name);
+            const auto effectiveName = effectiveDataSourceName(name);
+            out = effectiveName.empty() ? mgr().getDefault() : mgr().getDataSource(effectiveName);
             if (out) return common::Status::OK();
-            return name.empty() ? noDefault() : notFound(name);
+            return effectiveName.empty() ? noDefault() : notFound(effectiveName);
         }
     }
 
@@ -164,46 +171,47 @@ namespace dbmw {
     }
 
     common::Status DBMW::transaction(const core::SessionFn &fn) {
-        const auto ds = mgr().getDefault();
-        if (!ds) return noDefault();
+        std::shared_ptr<core::DataSource> ds;
+        if (const auto st = resolve(std::string(), ds); !st.ok()) return st;
         return ds->transaction(fn);
     }
 
     common::Status DBMW::transaction(const std::string &dataSource, const core::SessionFn &fn) {
-        const auto ds = mgr().getDataSource(dataSource);
-        if (!ds) return notFound(dataSource);
+        std::shared_ptr<core::DataSource> ds;
+        if (const auto st = resolve(dataSource, ds); !st.ok()) return st;
         return ds->transaction(fn);
     }
 
     common::Status DBMW::transaction(const common::TransactionOptions &options,
                                      const core::SessionFn &fn) {
-        const auto ds = mgr().getDefault();
-        if (!ds) return noDefault();
+        std::shared_ptr<core::DataSource> ds;
+        if (const auto st = resolve(std::string(), ds); !st.ok()) return st;
         return ds->transaction(options, fn);
     }
 
     common::Status DBMW::transaction(const std::string &dataSource,
                                      const common::TransactionOptions &options,
                                      const core::SessionFn &fn) {
-        const auto ds = mgr().getDataSource(dataSource);
-        if (!ds) return notFound(dataSource);
+        std::shared_ptr<core::DataSource> ds;
+        if (const auto st = resolve(dataSource, ds); !st.ok()) return st;
         return ds->transaction(options, fn);
     }
 
     common::Status DBMW::withSession(const core::SessionFn &fn) {
-        const auto ds = mgr().getDefault();
-        if (!ds) return noDefault();
+        std::shared_ptr<core::DataSource> ds;
+        if (const auto st = resolve(std::string(), ds); !st.ok()) return st;
         return ds->withSession(fn);
     }
 
     common::Status DBMW::withSession(const std::string &dataSource, const core::SessionFn &fn) {
-        const auto ds = mgr().getDataSource(dataSource);
-        if (!ds) return notFound(dataSource);
+        std::shared_ptr<core::DataSource> ds;
+        if (const auto st = resolve(dataSource, ds); !st.ok()) return st;
         return ds->withSession(fn);
     }
 
     std::shared_ptr<core::DataSource> DBMW::dataSource(const std::string &name) {
-        return name.empty() ? mgr().getDefault() : mgr().getDataSource(name);
+        const auto effectiveName = effectiveDataSourceName(name);
+        return effectiveName.empty() ? mgr().getDefault() : mgr().getDataSource(effectiveName);
     }
 
     bool DBMW::poolStats(core::ConnectionPool::Stats &out, const std::string &name) {

@@ -27,6 +27,7 @@ namespace dbmw::common {
         // 复用 g_stateVersion 让线程本地快照一致刷新。
         PoolMetricsObserver g_poolObserver;
         PoolMetricsCollector g_poolCollector;
+        const void *g_poolCollectorOwner = nullptr;
         // 配置或观察者每次变更时递增；线程据此判断本地快照是否已过期。
         std::atomic<std::uint64_t> g_stateVersion{1};
         std::unordered_map<std::uint64_t, SlowSqlStats> g_slowStats;
@@ -337,12 +338,27 @@ namespace dbmw::common {
         g_stateVersion.fetch_add(1, std::memory_order_release);
     }
 
-    void Observability::setPoolMetricsCollector(PoolMetricsCollector collector) {
+    void Observability::setPoolMetricsCollector(PoolMetricsCollector collector,
+                                                const void *owner) {
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             g_poolCollector = std::move(collector);
+            g_poolCollectorOwner = g_poolCollector ? owner : nullptr;
         }
         g_stateVersion.fetch_add(1, std::memory_order_release);
+    }
+
+    void Observability::clearPoolMetricsCollector(const void *owner) {
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            if (g_poolCollectorOwner == owner) {
+                g_poolCollector = {};
+                g_poolCollectorOwner = nullptr;
+                changed = true;
+            }
+        }
+        if (changed) g_stateVersion.fetch_add(1, std::memory_order_release);
     }
 
     PoolMetricsEvent Observability::samplePoolMetrics() noexcept {

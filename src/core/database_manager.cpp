@@ -106,14 +106,17 @@ void pinRequestWrite() {
                                            common::ResultSet *result,
                                            std::int64_t *affected,
                                            Fn &&fn) {
+            // guard 覆盖 before 拒绝路径，保证 onCompletion 对每个顶层入口恰好一次；
+            // 同时其执行深度会抑制 DataSource 内部调用 Session 时的重复埋点。
+            auto guard = detail::makeInterceptorGuard(view);
+            if (!guard.active()) return std::forward<Fn>(fn)();
             if (auto st = detail::runBeforeExecution(view); !st.ok()) {
                 view.status = st;
                 view.result = nullptr;
                 return st;
             }
-            auto guard = detail::makeInterceptorGuard(view);
             const auto t0 = std::chrono::steady_clock::now();
-            // M6（§8.3 + §3.5）：把 onRoute 决策（含 shadow / targetDataSource）
+            // M6（§8.3 + §3.5）：把 onRoute 决策（含 shadow）
             // 压入线程栈顶，让 readTarget / writeTargets / dispatchWrite / cacheLookup
             // 在路由期能读到。这是和 M5 同源的设计——M5 的 idempotency 由调用方
             // 显式 push ContextScope 透传；M6 的 shadow 由 onRoute 写入 routeCtx，
@@ -539,7 +542,9 @@ void pinRequestWrite() {
             std::exception_ptr callbackError;
             const common::RowCallback guardedCallback = [&](const common::Row &row) {
                 try {
-                    return callback(row);
+                    auto transformed = row;
+                    detail::runOnRow(view, transformed);
+                    return callback(transformed);
                 } catch (...) {
                     callbackError = std::current_exception();
                     return false;
@@ -819,8 +824,16 @@ void pinRequestWrite() {
             // 借而不占：连接仍归本 Session，游标随会话其余语句共享同一条连接
             //（及若已开的事务快照）。BorrowedInSession 时 Cursor 的 handle_ 为空，
             // close() 只关服务端游标、不归还连接，连接随 Session 析构归还。
+            Cursor::RowTransform transform = [dataSource = dataSource_, sql, params, ctx]
+                                             (common::Row &row) mutable {
+                ExecutionView rowView{dataSource, sql, common::OperationType::Select,
+                                      &params, nullptr, 0, std::chrono::microseconds{0},
+                                      common::Status::OK(), false, 0, ctx};
+                detail::runOnRow(rowView, row);
+            };
             out = std::make_unique<Cursor>(nullptr, std::move(impl), audit_,
-                                           Cursor::Binding::BorrowedInSession);
+                                           Cursor::Binding::BorrowedInSession,
+                                           std::shared_ptr<void>{}, std::move(transform));
             return common::Status::OK();
         });
     }
@@ -1190,7 +1203,7 @@ void pinRequestWrite() {
 
     bool DataSource::cacheEligible() const {
         return !primary_ && QueryCache::enabled() &&
-            (!QueryCache::replicaOnly() || readReplica_);
+            (!QueryCache::replicaOnly() || readReplica_.load(std::memory_order_acquire));
     }
 
     bool DataSource::cacheLookup(const std::string &sql, const common::Params &params,
@@ -1248,7 +1261,7 @@ void pinRequestWrite() {
         // 刚写进去的数据，给它加缓存等于把强一致读悄悄降级成最终一致。
         // M6（§8.3）：影子读不进查询缓存——会污染真实租户的缓存。
         const bool caching = QueryCache::enabled() &&
-            (!QueryCache::replicaOnly() || readReplica_) &&
+            (!QueryCache::replicaOnly() || readReplica_.load(std::memory_order_acquire)) &&
             !common::ContextScope::current().shadow;
         std::string key;
         if (caching) {
@@ -1268,10 +1281,10 @@ void pinRequestWrite() {
             }
             afterAttempt(status);
             if (status.ok()) {
-                // M7（§9.2 + I10）：与 DataSource::cacheStore 的守卫同源——
-                // SPI afterExecution 改写后置位 transformed，硬拦截入缓存。
-                // 性能上早于 QueryCache::put，避免一次 hash 计算 + 拷贝。
-                if (caching && !out.transformed) QueryCache::put(name_, key, out);
+                // 顶层 afterExecution 尚未运行，此处的 out 是驱动原始结果。
+                // 缓存原始结果，返回路径再按当前请求上下文做脱敏/改写，既避免
+                // 跨租户视图污染，也允许后续请求安全命中同一份原始缓存。
+                if (caching) QueryCache::put(name_, key, out);
                 return status;
             }
             if (!status.retryable || attempt == attempts) return status;
@@ -1310,7 +1323,7 @@ void pinRequestWrite() {
             return status;
         }
         const bool caching = QueryCache::enabled() &&
-            (!QueryCache::replicaOnly() || readReplica_) &&
+            (!QueryCache::replicaOnly() || readReplica_.load(std::memory_order_acquire)) &&
             !common::ContextScope::current().shadow;
         std::string key;
         if (caching) {
@@ -1330,10 +1343,9 @@ void pinRequestWrite() {
             }
             afterAttempt(status);
             if (status.ok()) {
-                // M7（§9.2 + I10）：与 DataSource::cacheStore 的守卫同源——
-                // SPI afterExecution 改写后置位 transformed，硬拦截入缓存。
-                // 性能上早于 QueryCache::put，避免一次 hash 计算 + 拷贝。
-                if (caching && !out.transformed) QueryCache::put(name_, key, out);
+                // 同无参数重载：这里只保存驱动原始结果；顶层拦截器改写发生在
+                // runWithInterceptors 返回前，不会反向污染缓存。
+                if (caching) QueryCache::put(name_, key, out);
                 return status;
             }
             if (!status.retryable || attempt == attempts) return status;
@@ -1829,10 +1841,19 @@ void pinRequestWrite() {
                 std::unique_ptr<ICursor> impl;
                 status = (*h)->openCursor(sql, params, opts, impl);
                 if (status.ok() && impl) {
+                    auto rowContext = common::ContextScope::current();
+                    Cursor::RowTransform transform = [dataSource = name_, sql, params, rowContext]
+                                                     (common::Row &row) mutable {
+                        ExecutionView rowView{dataSource, sql, common::OperationType::Select,
+                                              &params, nullptr, 0,
+                                              std::chrono::microseconds{0},
+                                              common::Status::OK(), false, 0, rowContext};
+                        detail::runOnRow(rowView, row);
+                    };
                     out = std::make_unique<Cursor>(std::move(h), std::move(impl),
                                                     Session::AuditContext{true, readOnly_},
                                                     Cursor::Binding::OwnsHandle,
-                                                    std::move(cursorLease));
+                                                    std::move(cursorLease), std::move(transform));
                     return status;
                 }
                 // 打开失败：impl 为 null 或报错，借出的连接随 h 析构归还，继续重试/上报。
@@ -2160,7 +2181,15 @@ void pinRequestWrite() {
     // -----------------------------------------------------------------------
     // DatabaseManager
     // -----------------------------------------------------------------------
-    DatabaseManager::DatabaseManager() = default;
+    struct PoolCollectorLease {
+        std::mutex mutex;
+        DatabaseManager *owner = nullptr;
+    };
+
+    DatabaseManager::DatabaseManager()
+        : poolCollectorLease_(std::make_shared<PoolCollectorLease>()) {
+        poolCollectorLease_->owner = this;
+    }
 
     DatabaseManager::~DatabaseManager() {
         shutdown(std::chrono::milliseconds(0));
@@ -2333,7 +2362,17 @@ void pinRequestWrite() {
         // （Prometheus exporter 等）按周期或按需拿到全量数据源快照。
         // 此处 lambda 只读 pools_，自身不需要锁；DatabaseManager::allPoolStats()
         // 内部会加 mtx_。
-        common::Observability::setPoolMetricsCollector([this] { return allPoolStats(); });
+        {
+            std::lock_guard<std::mutex> lock(poolCollectorLease_->mutex);
+            poolCollectorLease_->owner = this;
+        }
+        common::Observability::setPoolMetricsCollector(
+            [lease = poolCollectorLease_] {
+                std::lock_guard<std::mutex> lock(lease->mutex);
+                return lease->owner ? lease->owner->allPoolStats()
+                                    : std::vector<common::NamedPoolStats>{};
+            },
+            this);
 
         // 统计报告放在最后启动：此时新池与新数据源都已就位，采集回调拿到的
         // 必然是完整状态。start() 内部会先停掉上一版线程，因此热加载时
@@ -2667,6 +2706,8 @@ void pinRequestWrite() {
             std::move(limiter),
             emptyReplicaNames, opts.attach_heartbeat, pool, source); !st.ok())
             return st;
+        // 尚未发布到共享映射，可以无锁应用动态叶子专属选项。
+        source->readOnly_ = opts.read_only;
         // 段 2：锁内插入。若并发已被另一个 add/remove/insert 抢先，返回 ConfigError；
         // pool 出错抛出的资源由 reset 强制关闭（shutdown grace=0）。
         {
@@ -2696,6 +2737,11 @@ void pinRequestWrite() {
             if (pools_.find(name) == pools_.end()) {
                 return common::Status::error(common::ErrorCode::ConfigError,
                                              "datasource not found: " + name);
+            }
+            if (name == defaultName_) {
+                return common::Status::error(
+                    common::ErrorCode::ConfigError,
+                    "datasource '" + name + "' is the current default and cannot be removed");
             }
             // 引用完整性：扫描所有"组"datasource，若 name 出现在 primary / replicas
             // / failover.primaries 列表里则拒绝。
@@ -2729,6 +2775,13 @@ void pinRequestWrite() {
                                 + candidate->name()
                                 + "' as failover candidate (remove the group first)");
                         }
+                    }
+                    if (candidate->shadow_ && candidate->shadow_->name() == name) {
+                        return common::Status::error(
+                            common::ErrorCode::ConfigError,
+                            "datasource '" + name + "' is still referenced by group '"
+                            + candidate->name()
+                            + "' as shadow (remove the group first)");
                     }
                 }
             }
@@ -2787,6 +2840,12 @@ void pinRequestWrite() {
                 cfg, /*poolCfg=*/{}, opts, datasources_, {},
                 stagedBuffers, source); !st.ok())
                 return st;
+            // 动态建组后让 cache_on_replica_only 立即识别这些叶子。
+            for (const auto &replica : cfg.replicas) {
+                const auto it = datasources_.find(replica.name);
+                if (it != datasources_.end() && it->second)
+                    it->second->readReplica_.store(true, std::memory_order_release);
+            }
             datasources_[cfg.name] = source;
             // 先 push 到 writeBuffers_（未 start），让 shutdown 立刻可见。
             for (auto &buffer: stagedBuffers) writeBuffers_.push_back(buffer);
@@ -2849,10 +2908,30 @@ void pinRequestWrite() {
                                              "datasource '" + name
                                              + "' is not a group (use removeDataSource)");
             }
+            if (name == defaultName_) {
+                return common::Status::error(
+                    common::ErrorCode::ConfigError,
+                    "group '" + name + "' is the current default and cannot be removed");
+            }
             // friend 路径读 DataSource::writeBuffer_（组成员持同一 shared_ptr）。
             bufferToStop = it->second->writeBuffer_;
             wasGroup = true;
             datasources_.erase(it);
+            // readReplica_ 是现存组拓扑的派生状态。删除组后重新计算，避免
+            // 曾经做过副本的叶子永久保留标记，使 cache_on_replica_only
+            // 在拓扑变化后错误缓存普通数据源。
+            for (auto &entry : datasources_) {
+                if (entry.second && !entry.second->primary_)
+                    entry.second->readReplica_.store(false, std::memory_order_release);
+            }
+            for (const auto &entry : datasources_) {
+                const auto &group = entry.second;
+                if (!group || !group->primary_) continue;
+                for (const auto &replica : group->replicas_) {
+                    if (replica)
+                        replica->readReplica_.store(true, std::memory_order_release);
+                }
+            }
             // 把对应 writeBuffer 指针从成员容器中移除。
             if (bufferToStop) {
                 writeBuffers_.erase(std::remove(writeBuffers_.begin(),
@@ -2885,6 +2964,12 @@ void pinRequestWrite() {
         // 回调就会摸到已经搬空的容器。stop() 在锁外调用，避免与 allPoolStats()
         // 抢同一把 mtx_ 造成死锁。
         if (statsReporter_) statsReporter_->stop();
+        // Observability 是进程级槽位，不能让它在 manager 析构后继续持有裸 this。
+        common::Observability::clearPoolMetricsCollector(this);
+        if (poolCollectorLease_) {
+            std::lock_guard<std::mutex> lock(poolCollectorLease_->mutex);
+            poolCollectorLease_->owner = nullptr;
+        }
 
         std::unordered_map<std::string, std::shared_ptr<ConnectionPool> > oldPools;
         std::unordered_map<std::string, std::shared_ptr<DataSource> > oldSources;

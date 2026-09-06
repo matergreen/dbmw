@@ -273,7 +273,7 @@ namespace dbmw::config {
 
     // 拦截器（SPI，全局级）。
     //
-    // dbmw 提供横切扩展点（ISqlInterceptor：路由/执行前/执行后/收尾）。
+    // dbmw 提供横切扩展点（ISqlInterceptor：路由/执行前/执行后/逐行/收尾）。
     // 注册走 API（DBMW::addInterceptor），本字段只控制总开关：
     //   - 关（默认）：热路径根本不走拦截器注册表的查表，零开销；
     //   - 开：每个 SQL 触发回调链（按注册顺序）。
