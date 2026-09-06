@@ -717,6 +717,52 @@ auto physicalPools = dbmw::DBMW::allPoolStats();
 
 Slow SQL uses parameterized-template fingerprint aggregation, with fixed capacity and a duration histogram to bound memory. Observer exceptions are isolated and do not change the database operation result. A group's `poolStats` aggregates its members, while `allPoolStats` returns every physical pool — handy for locating a specific primary or replica.
 
+### Trace context (traceId / spanId)
+
+`OperationEvent` and `SlowSqlRecord` carry two fields `traceId` and `spanId` (W3C `traceparent` shape: 32 / 16 lowercase hex), auto-injected by `Observability::emitSql` from `ContextScope::current()` as the very first thing it does:
+
+```cpp
+#include "dbmw/common/context.h"
+dbmw::common::SqlContext ctx;
+ctx.traceId = "4bf92f3577b34da6a3ce929d0e0e4736";     // 32 hex
+ctx.spanId  = "00f067aa0ba902b7";                       // 16 hex (optional)
+dbmw::common::ContextScope scope(ctx);
+
+ds.execute("UPDATE t SET v = ? WHERE id = ?", ...);
+// When the event hits the observer / sql_log / slow-Sql path, event.traceId / spanId are already filled.
+```
+
+**Key contracts**:
+- **`traceId` is never generated** — when there's no caller-side context, both fields stay empty;
+  "phantom trace" is never emitted (same source as the "no phantom span" rule for `nextSpanId`).
+- **`spanId` follows the caller when available**, otherwise it is auto-generated as 16 hex per
+  statement (a thread-local counter — not unique across threads, but never repeated inside one trace)
+  so the natural "one HTTP request = many SQL statements" granularity is preserved.
+- **`emit` outside `emitSql` doesn't read ctx** — `Begin` / `Commit` / `Rollback` and other
+  non-SQL operations keep their trace empty, never faking a trace for a non-existent SQL chain.
+- **Log format** — when `sql_log.mode == "full"` and trace is non-empty, the line ends with
+  `trace=... span=...` so you can pull a window by trace, without polluting legacy no-trace links.
+- **Async propagation is automatic** — `StatementOp` / `SessionOp` snapshot `entryCtx` so
+  worker threads automatically wrap a `ContextScope(entryCtx)` before executing; the caller
+  never has to thread the context manually.
+
+**W3C `traceparent` parse and format**:
+
+```cpp
+auto ctxOpt = dbmw::common::parseTraceparent(
+    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+// Validation: length must be exactly 55; version must be `00`; trace-id must not be all 0;
+// trace-id / span-id must be valid hex. Invalid returns std::nullopt; business decides
+// whether to drop or fall back.
+
+auto parent = dbmw::common::formatTraceparent(traceId, spanId);
+// Strict 55 bytes: `00-<32 hex>-<16 hex>-<01 flags>` (flags default to 01 = sampled).
+```
+
+`parseTraceparent` and `formatTraceparent` follow W3C Trace Context §3.2's fixed 55-byte shape
+and are interoperable with OpenTelemetry / Jaeger. The flags segment is the sampling bit,
+parsed independently from trace/span fields, and cannot reverse-contaminate them.
+
 ## Error codes
 
 `common::Status` carries an `ErrorCode`, convertible to a string via `common::errorCodeToString()`.

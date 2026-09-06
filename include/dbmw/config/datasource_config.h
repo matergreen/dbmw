@@ -271,6 +271,19 @@ namespace dbmw::config {
         int statement_timeout_ms = 0;
     };
 
+    // 拦截器（SPI，全局级）。
+    //
+    // dbmw 提供横切扩展点（ISqlInterceptor：路由/执行前/执行后/收尾）。
+    // 注册走 API（DBMW::addInterceptor），本字段只控制总开关：
+    //   - 关（默认）：热路径根本不走拦截器注册表的查表，零开销；
+    //   - 开：每个 SQL 触发回调链（按注册顺序）。
+    //
+    // 即使 enabled=true，若无任何已注册拦截器也是 noop——两层独立。
+    // 该开关由配置写入，运行时不可改（避免热加载导致一半语句带钩、一半不带）。
+    struct InterceptorsConfig {
+        bool enabled = false;  // 默认关闭：SPI 不是默认开的功能
+    };
+
     struct DataSourceGroupConfig {
         std::string name;
         std::string primary;
@@ -296,6 +309,7 @@ namespace dbmw::config {
         CursorConfig cursor;                 // 游标能力开关与上限
         PreparedCacheConfig prepared_cache;  // 预编译语句复用（连接级句柄缓存）
         AsyncConfig async;                   // 异步执行器（v0.2.0）
+        InterceptorsConfig interceptors;     // SPI 总开关（v0.4.0 M1）
         std::vector<DataSourceConfig> datasources;
         std::vector<DataSourceGroupConfig> groups;
     };

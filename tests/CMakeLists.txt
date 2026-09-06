@@ -8,6 +8,16 @@ target_link_libraries(dbmw_core_test PRIVATE dbmw)
 add_executable(dbmw_async_test dbmw_async_test.cpp)
 target_link_libraries(dbmw_async_test PRIVATE dbmw)
 
+# M1 SPI 上下文层单测：SqlContext / ContextScope / W3C traceparent 解析、
+# nextSpanId 行为、LIFO 不变量、线程局部性。无第三方依赖。
+add_executable(dbmw_context_test dbmw_context_test.cpp)
+target_link_libraries(dbmw_context_test PRIVATE dbmw)
+
+# M1 SPI 拦截器层单测：InterceptorRegistry 生命周期 / I11 异常吞掉 /
+# I9 分层 / I7 递归防护。extern 引用 core::detail 的实现入口。
+add_executable(dbmw_interceptor_test dbmw_interceptor_test.cpp)
+target_link_libraries(dbmw_interceptor_test PRIVATE dbmw)
+
 # 真实数据库集成测试默认不构建，避免普通单元测试依赖外部服务；
 # 开启时由各 DBMW_TEST_* 环境变量提供连接信息，测试只操作自己的临时对象。
 if(DBMW_BUILD_INTEGRATION_TESTS AND DBMW_ENABLE_POSTGRES)
@@ -60,3 +70,6 @@ endif()
 
 add_test(NAME dbmw_core_test COMMAND dbmw_core_test)
 add_test(NAME dbmw_async_test COMMAND dbmw_async_test)
+add_test(NAME dbmw_context_test COMMAND dbmw_context_test)
+add_test(NAME dbmw_interceptor_test COMMAND dbmw_interceptor_test)
+add_test(NAME dbmw_observability_test COMMAND dbmw_observability_test)

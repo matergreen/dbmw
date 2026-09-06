@@ -1,4 +1,5 @@
 #include "dbmw/async/dbmw_async.h"
+#include "dbmw/common/context.h"
 #include "dbmw/common/logger.h"
 #include "dbmw/dbmw.h"
 
@@ -234,6 +235,13 @@ namespace dbmw::async {
                 std::function<void(R &&)> cb;
 
                 StatementPolicy policy;
+
+                // M1 SPI 上下文快照：在 submit 调用线程拍照（caller 栈顶 ctx），
+                // worker 线程在 attemptFn 调用前原样装回——保证同步与异步路径下
+                // SPI 回调看到的"业务上下文"形态完全一致。空 ctx 表示调用方
+                // 没有 ContextScope，与同步路径（该栈层使用 defaultInstance）
+                // 行为等价。
+                common::SqlContext entryCtx;
             };
 
             // 会话/事务操作上下文（§8.5：整段复用同步实现）。
@@ -245,6 +253,10 @@ namespace dbmw::async {
                 core::SessionFn fn;
                 std::function<void(OpResult &&)> cb;
                 std::chrono::milliseconds borrowTimeout{-1};
+
+                // M1 SPI：同 StatementOp::entryCtx。worker 跑回调前装回，
+                // 回调内的 Session 子语句自动继承（与同步 runGuarded 同源）。
+                common::SqlContext entryCtx;
             };
         }
 
@@ -424,6 +436,10 @@ namespace dbmw::async {
                 ctx->bufferedMaker = std::move(bufferedMaker);
                 ctx->cb = std::move(cb);
                 ctx->policy = policy;
+                // M1 SPI：拍照调用线程栈顶 ctx，worker 跑 attemptFn 前装回
+                // （见 step2Statement 的 ContextScope scope(ctx->entryCtx)），
+                // 保证异步与同步路径下 Session 子语句看到的"业务上下文"形态一致。
+                ctx->entryCtx = common::ContextScope::current();
 
                 // 结果缓存：只做在叶子目标上，key 带叶子自己的名字（与同步一致）。
                 if (policy.cacheable) {
@@ -570,6 +586,10 @@ namespace dbmw::async {
 
                     R r;
                     try {
+                        // 装回 worker 线程栈：attemptFn 内 Session 子语句的
+                        // runOnRoute 看到的是 caller 的 ctx（与同步路径同源）。
+                        // 异常安全靠 RAII：即便 attemptFn 抛，析构依旧还原。
+                        common::ContextScope scope(ctx->entryCtx);
                         ctx->attemptFn(*session, r);
                     } catch (const std::exception &e) {
                         r.status = common::Status::error(
@@ -753,6 +773,8 @@ namespace dbmw::async {
                 ctx->fn = fn;
                 ctx->cb = std::move(cb);
                 ctx->borrowTimeout = opts.borrowTimeout;
+                // 拍照调用线程栈顶 ctx：worker 跑回调前装回（见 runSessionOp）。
+                ctx->entryCtx = common::ContextScope::current();
 
                 registryAdd();
                 const Handle handle(ctx->op);
@@ -794,6 +816,10 @@ namespace dbmw::async {
                     // 不改写结果，避免"提交成功却报 Cancelled"诱发重复重放。
                     common::Status st;
                     try {
+                        // 装回 worker 线程栈：回调内 Session 子语句自动继承
+                        // caller 的 ctx（与同步 runGuarded 同源——后者把空 ctx
+                        // 压栈；异步把 caller 拍照的 ctx 压栈，对调用方透明）。
+                        common::ContextScope scope(ctx->entryCtx);
                         if (ctx->transactional) {
                             st = ctx->root->transactionInternal(
                                 ctx->txOpts, ctx->fn, ctx->borrowTimeout,

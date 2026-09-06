@@ -38,6 +38,9 @@ namespace dbmw {
         if (!config::ConfigLoader::loadFromFile(configPath, cfg, err)) {
             return common::Status::error(common::ErrorCode::ConfigError, err);
         }
+        // SPI 拦截器总开关必须在 init 入口设置——它影响后续每条语句的 hot path，
+        // 若延后到 init 结束会出现"部分已发放的语句还没开门"的中间状态。
+        core::InterceptorRegistry::setEnabled(cfg.interceptors.enabled);
         const auto st = mgr().init(cfg);
         // 异步执行器在核心初始化成功后接线（v0.2.0 §9.1）。
         // 放在 dbmw.cpp 而非 DatabaseManager::init：core 不反向依赖 async
@@ -54,6 +57,8 @@ namespace dbmw {
         if (!config::ConfigLoader::loadFromFile(configPath, cfg, error)) {
             return common::Status::error(common::ErrorCode::ConfigError, error);
         }
+        // 热加载路径同样刷新开关。运行时变更会影响后续每条语句。
+        core::InterceptorRegistry::setEnabled(cfg.interceptors.enabled);
         const auto st = mgr().init(cfg, grace);
         // 热加载不重建线程池（initEngine 内部保留既有执行器）；
         // 只更新全局默认语句期限。
@@ -237,5 +242,13 @@ namespace dbmw {
 
     void DBMW::setObserver(common::OperationObserver observer) {
         common::Observability::setObserver(std::move(observer));
+    }
+
+    void DBMW::addInterceptor(std::shared_ptr<core::ISqlInterceptor> interceptor) {
+        core::InterceptorRegistry::add(std::move(interceptor));
+    }
+
+    void DBMW::clearInterceptors() {
+        core::InterceptorRegistry::clear();
     }
 } // namespace dbmw

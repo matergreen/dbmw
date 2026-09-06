@@ -4,6 +4,7 @@
 #include "dbmw/common/types.h"
 #include "dbmw/common/observer.h"
 #include "dbmw/core/database_manager.h"
+#include "dbmw/core/interceptor.h"
 
 #include <chrono>
 #include <memory>
@@ -133,6 +134,19 @@ namespace dbmw
 
         // 注册进程级操作观察器（事件不包含 SQL 与参数）。
         static void setObserver(common::OperationObserver observer);
+
+        // SPI：注册全局 SQL 拦截器（v0.4.0 M1）。
+        //
+        // 注册顺序即调用顺序。建议在 `init()` 之前调用——若在 `init()` 之后
+        // 注册，已在执行的语句不会回头补钩。每条 SQL 触发 onRoute/before/
+        // after/onCompletion 四回调，由 `interceptors.enabled` 配置总开关。
+        // 必须在进程级注册——不让数据源级屏蔽，因为 SPI 是横切关注点。
+        // 也必须在被另一拦截器依赖的代码中**早于**该依赖注册，避免执行期间
+        // 注册顺序与设计意图不一致。
+        static void addInterceptor(std::shared_ptr<core::ISqlInterceptor> interceptor);
+
+        // 清空所有已注册拦截器。建议在测试间调用，避免跨用例泄漏。
+        static void clearInterceptors();
     };
 } // namespace dbmw
 

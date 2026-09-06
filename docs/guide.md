@@ -770,6 +770,51 @@ auto physicalPools = dbmw::DBMW::allPoolStats();
 不会改变数据库操作结果。数据源组的 `poolStats` 会聚合成员，`allPoolStats` 则返回每个物理池，
 便于定位具体主库或副本。
 
+### 追踪上下文（traceId / spanId）
+
+`OperationEvent` / `SlowSqlRecord` 携带两个字段 `traceId` 与 `spanId`（W3C `traceparent` 节
+口径，32 / 16 小写 hex），由 `Observability::emitSql` 在最早期自动从 `ContextScope::current()`
+注入：
+
+```cpp
+#include "dbmw/common/context.h"
+dbmw::common::SqlContext ctx;
+ctx.traceId = "4bf92f3577b34da6a3ce929d0e0e4736";     // 32 hex
+ctx.spanId  = "00f067aa0ba902b7";                       // 16 hex（可选）
+dbmw::common::ContextScope scope(ctx);
+
+ds.execute("UPDATE t SET v = ? WHERE id = ?", ...);
+// 进入 observer / sql_log / slowSql 时，event.traceId / spanId 已就位。
+```
+
+**关键约定**：
+- **traceId 不自动生成**：没有调用方上下文时两字段都保持空串，不会发"幽灵 trace"——
+  与 `nextSpanId`「不发幽灵 span」同源。
+- **spanId 优先沿用调用方**：未填则在有 trace 的前提下按语句自动生成 16 hex，
+  跨线程不保证唯一但同一 trace 内不重复，便于按"次请求 = 多条 SQL"颗粒度对齐。
+- **`emitSql` 之外的 `emit` 不读 ctx**：`Begin` / `Commit` / `Rollback` 等没有 SQL 语义
+  的操作保留空 trace，避免给不存在的链路伪造一条 trace 误导聚合。
+- **日志格式**：`sql_log.mode == "full"` 且 trace 非空时，行尾追加 `trace=... span=...`
+  便于按 trace 拉一段窗口，不污染无 trace 传统链路。
+- **异步自动传递**：M1 已为 `StatementOp` / `SessionOp` 拍 `entryCtx` 快照，worker
+  线程执行前会自动 `ContextScope(entryCtx)` 装回，调用方无需手工跨线程。
+
+**W3C `traceparent` 解析与格式化**：
+
+```cpp
+auto ctxOpt = dbmw::common::parseTraceparent(
+    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+// 校验：长度必须 55；version 必须 `00`；trace-id 不能全 0；trace/span 必须是合法 hex。
+// 非法一律返回 std::nullopt，由业务决定丢弃还是回退。
+
+auto parent = dbmw::common::formatTraceparent(traceId, spanId);
+// 输出严格 55 字节：`00-<32 hex>-<16 hex>-<01 flags>`（flags 缺省 01 = sampled）。
+```
+
+`parseTraceparent` 与 `formatTraceparent` 严格按 W3C Trace Context §3.2 节要求的固定
+55 字节格式实现，与 OpenTelemetry / Jaeger 兼容；flags 段是"采样标记"位，独立于
+traceId / spanId 解析，不会反向污染字段。
+
 ## 错误码
 
 `common::Status` 携带 `ErrorCode`，可用 `common::errorCodeToString()` 转成字符串。

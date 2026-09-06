@@ -27,6 +27,13 @@ namespace dbmw::common {
     };
 
     // 默认不携带 SQL 文本和绑定参数，避免观测链路意外泄漏业务数据。
+    //
+    // 追踪字段（traceId / spanId）由 emitSql 从当前 common::ContextScope 自动填充：
+    //   - traceId 来自业务入口解析的链路 ID（建议 32 hex，W3C traceparent），
+    //     也可不填（中间件不强制）；
+    //   - spanId 优先取调用方栈顶 spanId（沿用同一跨度）；为空时按语句自动生成
+    //     16 hex 子跨度——便于在调用方不感知的情况下，按"次业务请求 = 多条 SQL"
+    //     的颗粒度对齐链路。
     struct OperationEvent {
         std::string dataSource;
         OperationType type = OperationType::Query;
@@ -36,6 +43,9 @@ namespace dbmw::common {
         std::string sqlTemplate;
         std::string renderedSql;
         std::uint64_t sqlFingerprint = 0;
+        // M2 追踪上下文：见上。空串代表"未声明"。
+        std::string traceId;
+        std::string spanId;
         bool slow = false;
     };
 
@@ -66,6 +76,11 @@ namespace dbmw::common {
         std::chrono::microseconds duration{0};
         ErrorCode errorCode = ErrorCode::Ok;
         std::string sqlState;
+        // M2 追踪上下文：与 OperationEvent 同源，便于按 trace 检索慢 SQL
+        // 窗口里的具体样本（聚合 SlowSqlStats 不需要 trace，按 fingerprint
+        // 取即可）。
+        std::string traceId;
+        std::string spanId;
     };
 
     using OperationObserver = std::function<void(const OperationEvent &)>;

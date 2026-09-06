@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(dbmw VERSION 0.3.0 LANGUAGES CXX)
+project(dbmw VERSION 0.4.0 LANGUAGES CXX)
 
 # 生成 compile_commands.json，便于 CLion/clangd/VS Code 正确解析
 # 工程的 include 路径与编译选项（消除“找不到头文件”类误报）。
@@ -73,6 +73,7 @@ install(TARGETS nlohmann_json EXPORT dbmwTargets)
 # ---------------------------------------------------------------------------
 set(DBMW_SOURCES
     src/common/types.cpp
+    src/common/context.cpp
     src/common/observer.cpp
     src/common/sql_analyze.cpp
     src/config/datasource_config.cpp
@@ -87,6 +88,7 @@ set(DBMW_SOURCES
     src/core/query_cache.cpp
     src/core/write_buffer.cpp
     src/core/stats_reporter.cpp
+    src/core/interceptor.cpp
     src/driver/driver_registry.cpp
     src/driver/driver_factory.cpp
     src/driver/mysql_driver.cpp

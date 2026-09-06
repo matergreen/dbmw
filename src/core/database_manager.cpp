@@ -9,6 +9,7 @@
 #include "dbmw/core/sql_auditor.h"
 #include "dbmw/core/query_cache.h"
 #include "dbmw/core/stats_reporter.h"
+#include "dbmw/core/interceptor.h"            // M1 SPI：拦截器埋点
 
 #include <chrono>
 #include <atomic>
@@ -28,6 +29,60 @@
 
 namespace dbmw::core {
     namespace {
+        // M1 SPI 不变量 I9：拦截器埋点严格走"最外层入口"模型。
+        //
+        //   公开入口清单：
+        //     · DataSource::query / execute / executeBatch / queryEach / openCursor
+        //       （12+1 个 SQL 执行重载）埋点。
+        //     · DataSource::transaction（4 个事务重载）**不**直接调拦截器，
+        //       只 push ContextScope；事务回调内的 Session 子语句自己触发布点。
+        //     · Session::query / execute / queryEach / executeBatch /
+        //       executePrepared / openCursor / prepare 公开入口全部埋点——
+        //       业务拿到 Session 实例，它就是该业务的最外层入口；事务回调里
+        //       的 Session::query 同样要埋，traceId/spanId 经栈顶 SqlContext 透传。
+        //     · Session::begin / commit / rollback 是事务控制 SQL，**不**埋——
+        //       事务层模型由事务拦截器（M5+）独立负责，不放进 SQL 拦截器。
+        //
+        //   *Ungated 系列（queryUngated/executeUngated/.../openCursorUngated）
+        //   全部不埋：它们是组→叶子转发 / 驱动调用的内部细节，埋了等于把一次
+        //   业务调用发多次回调。
+        //
+        // 这是为什么下面的 4 个 transaction 入口只做 ctx push、不发拦截器回调：
+        // 事务回调里的 Session 子语句会拿到栈顶 ctx，自己埋。视图层 (`detail::`)
+        // 的递归防护 + 栈深度限制 (`kMaxDepth=64`) 把拦截器自身引发的回环
+        // 自动拦在第二层之外，业务无感。
+
+        // M1 SPI 埋点统一助手：
+        //   在被调用的 SQL 路径上自动处理
+        //   beforeExecution（拒绝即中断）→ guard 构造 → 执行 fn →
+        //   收集 duration / status / result → afterExecution；guard 析构即
+        //   onCompletion（恰好一次）。
+        //   不构造、不包装、绝不重抛；拦截器异常已被 detail 层 try/catch 吞掉（I11）。
+        //
+        // 调用方负责：构造 ctx / 调用 runOnRoute / 构造 view / 决定 result 与
+        // affected 是否对外暴露（nullptr/0 = 不暴露）。
+        template <typename Fn>
+        common::Status runWithInterceptors(ExecutionView &view,
+                                           common::ResultSet *result,
+                                           std::int64_t *affected,
+                                           Fn &&fn) {
+            if (auto st = detail::runBeforeExecution(view); !st.ok()) {
+                view.status = st;
+                view.result = nullptr;
+                return st;
+            }
+            auto guard = detail::makeInterceptorGuard(view);
+            const auto t0 = std::chrono::steady_clock::now();
+            auto st = std::forward<Fn>(fn)();
+            view.duration = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0);
+            view.status = st;
+            view.result = st.ok() ? result : nullptr;
+            if (st.ok() && affected) view.affected = *affected;
+            detail::runAfterExecution(view);
+            return st;
+        }
+
         // 退避抖动用的真随机数，返回 [0, range) 内的值。
         //
         // 抖动唯一的目的就是把并发重试打散。用 std::hash<std::thread::id>
@@ -115,6 +170,12 @@ namespace dbmw::core {
 
         // 执行用户回调并兜住异常：事务场景下异常必须转成失败，否则无法触发回滚。
         common::Status runGuarded(Session &s, const SessionFn &fn) {
+            // M1 SPI（I9）：**不**主动 push 一层空 SqlContext。回调进入即继承
+            // 调用方的栈顶 ctx——同步路径下是业务方在入口装的 traceId/tenantId，
+            // 异步路径下被 async_engine.cpp 装回的 entryCtx 接管。Session 子语句
+            // 的拦截器视图 `ContextScope::current()` 因此与调用方一致，跨路径
+            // 形态统一（设计 §M1 I9 + §M2 R1）。
+            // 旧版本曾 push 空 ctx，导致业务 traceId 在事务回调内被遮蔽——已纠正。
             try {
                 return fn(s);
             } catch (const std::exception &e) {
@@ -282,201 +343,292 @@ namespace dbmw::core {
     common::Status Session::query(const std::string &sql, common::ResultSet &out) const
     {
         if (const auto a = auditStatement(sql, common::OperationType::Query); !a.ok()) return a;
-        std::uint64_t rows = 0;
-        const common::Params params;
-        const auto status = observeSql(dataSource_, common::OperationType::Query, sql, params,
-                                       h_->get(), rows, [&] {
-            const auto result = (*h_)->query(sql, out);
-            rows = out.rowCount();
-            return result;
+        // M1 SPI 埋点：会话内 SQL 入口（I9）。栈顶 ctx 来自外层 ContextScope
+        // （事务回调内：runGuarded 已 push；业务裸调 withSession：业务方自己 push）。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Query, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Query,
+                           /*params*/ nullptr, /*result*/ &out,
+                           /*affected*/ 0, std::chrono::microseconds{0},
+                           common::Status::OK(), /*cached*/ false,
+                           /*depth*/ 0, ctx};
+        return runWithInterceptors(view, &out, nullptr, [&] {
+            std::uint64_t rows = 0;
+            const common::Params params;
+            const auto status = observeSql(dataSource_, common::OperationType::Query, sql, params,
+                                           h_->get(), rows, [&] {
+                const auto result = (*h_)->query(sql, out);
+                rows = out.rowCount();
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     common::Status Session::query(const std::string &sql, const common::Params &params,
                                   common::ResultSet &out) const
     {
         if (const auto a = auditStatement(sql, common::OperationType::Query); !a.ok()) return a;
-        std::uint64_t rows = 0;
-        const auto status = observeSql(dataSource_, common::OperationType::Query, sql, params,
-                                       h_->get(), rows, [&] {
-            const auto result = runPreparedQuery(sql, params, out);
-            rows = out.rowCount();
-            return result;
+        // M1 SPI 埋点：会话内 SQL 入口（I9）。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Query, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Query,
+                           &params, &out, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, &out, nullptr, [&] {
+            std::uint64_t rows = 0;
+            const auto status = observeSql(dataSource_, common::OperationType::Query, sql, params,
+                                           h_->get(), rows, [&] {
+                const auto result = runPreparedQuery(sql, params, out);
+                rows = out.rowCount();
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     common::Status Session::execute(const std::string &sql, std::int64_t &affected) const
     {
         if (const auto a = auditStatement(sql, common::OperationType::Execute); !a.ok()) return a;
-        std::uint64_t rows = 0;
-        const common::Params params;
-        const auto status = observeSql(dataSource_, common::OperationType::Execute, sql, params,
-                                       h_->get(), rows, [&] {
-            const auto result = (*h_)->execute(sql, affected);
-            rows = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
-            if (result.ok()) didWrite_ = true;
-            return result;
+        // M1 SPI 埋点：会话内 SQL 入口（I9）。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Execute, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Execute,
+                           nullptr, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, &affected, [&] {
+            std::uint64_t rows = 0;
+            const common::Params params;
+            const auto status = observeSql(dataSource_, common::OperationType::Execute, sql, params,
+                                           h_->get(), rows, [&] {
+                const auto result = (*h_)->execute(sql, affected);
+                rows = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
+                if (result.ok()) didWrite_ = true;
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     common::Status Session::execute(const std::string &sql, const common::Params &params,
                                     std::int64_t &affected) const
     {
         if (const auto a = auditStatement(sql, common::OperationType::Execute); !a.ok()) return a;
-        std::uint64_t rows = 0;
-        const auto status = observeSql(dataSource_, common::OperationType::Execute, sql, params,
-                                       h_->get(), rows, [&] {
-            const auto result = runPreparedExec(sql, params, affected, nullptr);
-            rows = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
-            if (result.ok()) didWrite_ = true;
-            return result;
+        // M1 SPI 埋点：会话内 SQL 入口（I9）。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Execute, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Execute,
+                           &params, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, &affected, [&] {
+            std::uint64_t rows = 0;
+            const auto status = observeSql(dataSource_, common::OperationType::Execute, sql, params,
+                                           h_->get(), rows, [&] {
+                const auto result = runPreparedExec(sql, params, affected, nullptr);
+                rows = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
+                if (result.ok()) didWrite_ = true;
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     common::Status Session::queryEach(const std::string &sql, const common::Params &params,
                                       const common::RowCallback &callback,
                                       std::uint64_t &rows) const {
         if (const auto a = auditStatement(sql, common::OperationType::Stream); !a.ok()) return a;
-        std::uint64_t observedRows = 0;
-        std::exception_ptr callbackError;
-        const common::RowCallback guardedCallback = [&](const common::Row &row) {
-            try {
-                return callback(row);
-            } catch (...) {
-                callbackError = std::current_exception();
-                return false;
-            }
-        };
-        const auto status = observeSql(dataSource_, common::OperationType::Stream, sql, params,
-                                       h_->get(), observedRows, [&] {
-            auto result = (*h_)->queryEach(sql, params, guardedCallback, rows);
-            if (result.ok() && callbackError) {
+        // M1 SPI 埋点：会话内流式 SQL 入口（I9）。流式无 ResultSet，view.result=nullptr。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Stream, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Stream,
+                           &params, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, nullptr, [&] {
+            std::uint64_t observedRows = 0;
+            std::exception_ptr callbackError;
+            const common::RowCallback guardedCallback = [&](const common::Row &row) {
                 try {
-                    std::rethrow_exception(callbackError);
-                } catch (const std::exception &e) {
-                    result = common::Status::error(
-                        common::ErrorCode::QueryError,
-                        std::string("stream callback threw: ") + e.what());
+                    return callback(row);
                 } catch (...) {
-                    result = common::Status::error(
-                        common::ErrorCode::QueryError,
-                        "stream callback threw an unknown exception");
+                    callbackError = std::current_exception();
+                    return false;
                 }
-            }
-            observedRows = rows;
-            return result;
+            };
+            const auto status = observeSql(dataSource_, common::OperationType::Stream, sql, params,
+                                           h_->get(), observedRows, [&] {
+                auto result = (*h_)->queryEach(sql, params, guardedCallback, rows);
+                if (result.ok() && callbackError) {
+                    try {
+                        std::rethrow_exception(callbackError);
+                    } catch (const std::exception &e) {
+                        result = common::Status::error(
+                            common::ErrorCode::QueryError,
+                            std::string("stream callback threw: ") + e.what());
+                    } catch (...) {
+                        result = common::Status::error(
+                            common::ErrorCode::QueryError,
+                            "stream callback threw an unknown exception");
+                    }
+                }
+                observedRows = rows;
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     common::Status Session::executeBatch(const std::string &sql,
                                          const common::ParamBatch &batch,
                                          common::BatchResult &out) const {
         if (const auto a = auditStatement(sql, common::OperationType::Batch); !a.ok()) return a;
-        std::uint64_t rows = 0;
-        // 批量操作可能含成千上万组参数，只记录模板，避免生成误导性的单组完整 SQL。
-        const common::Params noParams;
-        const auto status = observeSql(dataSource_, common::OperationType::Batch, sql, noParams,
-                                       nullptr, rows, [&] {
-            const auto result = (*h_)->executeBatch(sql, batch, out);
-            rows = out.totalAffected() > 0
-                ? static_cast<std::uint64_t>(out.totalAffected()) : 0;
-            if (result.ok()) didWrite_ = true;
-            return result;
+        // M1 SPI 埋点：会话内批量 SQL 入口（I9）。批次结果不进 view（与 DataSource 对称）。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Batch, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Batch,
+                           nullptr, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, nullptr, [&] {
+            std::uint64_t rows = 0;
+            // 批量操作可能含成千上万组参数，只记录模板，避免生成误导性的单组完整 SQL。
+            const common::Params noParams;
+            const auto status = observeSql(dataSource_, common::OperationType::Batch, sql, noParams,
+                                           nullptr, rows, [&] {
+                const auto result = (*h_)->executeBatch(sql, batch, out);
+                rows = out.totalAffected() > 0
+                    ? static_cast<std::uint64_t>(out.totalAffected()) : 0;
+                if (result.ok()) didWrite_ = true;
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     common::Status Session::execute(const std::string &sql, std::int64_t &affected,
                                     common::GeneratedKeys &out) const {
         if (const auto a = auditStatement(sql, common::OperationType::Execute); !a.ok()) return a;
-        std::uint64_t rows = 0;
-        const common::Params params;
-        const auto status = observeSql(dataSource_, common::OperationType::Execute, sql, params,
-                                       h_->get(), rows, [&] {
-            const auto result = (*h_)->execute(sql, affected, out);
-            rows = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
-            if (result.ok()) didWrite_ = true;
-            return result;
+        // M1 SPI 埋点：会话内 SQL 入口（I9）。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Execute, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Execute,
+                           nullptr, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, &affected, [&] {
+            std::uint64_t rows = 0;
+            const common::Params params;
+            const auto status = observeSql(dataSource_, common::OperationType::Execute, sql, params,
+                                           h_->get(), rows, [&] {
+                const auto result = (*h_)->execute(sql, affected, out);
+                rows = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
+                if (result.ok()) didWrite_ = true;
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     common::Status Session::execute(const std::string &sql, const common::Params &params,
                                     std::int64_t &affected, common::GeneratedKeys &out) const {
         if (const auto a = auditStatement(sql, common::OperationType::Execute); !a.ok()) return a;
-        std::uint64_t rows = 0;
-        const auto status = observeSql(dataSource_, common::OperationType::Execute, sql, params,
-                                       h_->get(), rows, [&] {
-            const auto result = runPreparedExec(sql, params, affected, &out);
-            rows = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
-            if (result.ok()) didWrite_ = true;
-            return result;
+        // M1 SPI 埋点：会话内 SQL 入口（I9）。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Execute, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Execute,
+                           &params, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, &affected, [&] {
+            std::uint64_t rows = 0;
+            const auto status = observeSql(dataSource_, common::OperationType::Execute, sql, params,
+                                           h_->get(), rows, [&] {
+                const auto result = runPreparedExec(sql, params, affected, &out);
+                rows = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
+                if (result.ok()) didWrite_ = true;
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     common::Status Session::query(const std::string &sql, const common::StreamParams &params,
                                   common::ResultSet &out) const {
         if (const auto a = auditStatement(sql, common::OperationType::Query); !a.ok()) return a;
-        std::uint64_t rows = 0;
-        // 流式参数不参与观测渲染：内容不是定值，且可能是几十 MB 的 BLOB。
-        // 观测只关心模板与耗时，这里传空参数即可。
-        const common::Params noParams;
-        const auto status = observeSql(dataSource_, common::OperationType::Query, sql, noParams,
-                                       h_->get(), rows, [&] {
-            const auto result = (*h_)->query(sql, params, out);
-            rows = out.rowCount();
-            return result;
+        // M1 SPI 埋点：会话内流式参数入口（I9）。流式参数不进 ExecutionView.params。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Query, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Query,
+                           nullptr, &out, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, &out, nullptr, [&] {
+            std::uint64_t rows = 0;
+            // 流式参数不参与观测渲染：内容不是定值，且可能是几十 MB 的 BLOB。
+            // 观测只关心模板与耗时，这里传空参数即可。
+            const common::Params noParams;
+            const auto status = observeSql(dataSource_, common::OperationType::Query, sql, noParams,
+                                           h_->get(), rows, [&] {
+                const auto result = (*h_)->query(sql, params, out);
+                rows = out.rowCount();
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     common::Status Session::execute(const std::string &sql, const common::StreamParams &params,
                                     std::int64_t &affected, common::GeneratedKeys &out) const {
         if (const auto a = auditStatement(sql, common::OperationType::Execute); !a.ok()) return a;
-        std::uint64_t rows = 0;
-        const common::Params noParams;
-        const auto status = observeSql(dataSource_, common::OperationType::Execute, sql, noParams,
-                                       h_->get(), rows, [&] {
-            const auto result = (*h_)->execute(sql, params, affected, out);
-            rows = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
-            if (result.ok()) didWrite_ = true;
-            return result;
+        // M1 SPI 埋点：会话内流式参数 SQL 入口（I9）。流式参数不进 ExecutionView.params。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Execute, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Execute,
+                           nullptr, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, &affected, [&] {
+            std::uint64_t rows = 0;
+            const common::Params noParams;
+            const auto status = observeSql(dataSource_, common::OperationType::Execute, sql, noParams,
+                                           h_->get(), rows, [&] {
+                const auto result = (*h_)->execute(sql, params, affected, out);
+                rows = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
+                if (result.ok()) didWrite_ = true;
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     common::Status Session::executeBatch(const std::string &sql,
                                          const common::StreamParamBatch &batch,
                                          common::BatchResult &out) const {
         if (const auto a = auditStatement(sql, common::OperationType::Batch); !a.ok()) return a;
-        std::uint64_t rows = 0;
-        const common::Params noParams;
-        const auto status = observeSql(dataSource_, common::OperationType::Batch, sql, noParams,
-                                       nullptr, rows, [&] {
-            const auto result = (*h_)->executeBatch(sql, batch, out);
-            rows = out.totalAffected() > 0
-                ? static_cast<std::uint64_t>(out.totalAffected()) : 0;
-            if (result.ok()) didWrite_ = true;
-            return result;
+        // M1 SPI 埋点：会话内批量 SQL 入口（I9）。批次结果不进 view（与 DataSource 对称）。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Batch, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Batch,
+                           nullptr, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, nullptr, [&] {
+            std::uint64_t rows = 0;
+            const common::Params noParams;
+            const auto status = observeSql(dataSource_, common::OperationType::Batch, sql, noParams,
+                                           nullptr, rows, [&] {
+                const auto result = (*h_)->executeBatch(sql, batch, out);
+                rows = out.totalAffected() > 0
+                    ? static_cast<std::uint64_t>(out.totalAffected()) : 0;
+                if (result.ok()) didWrite_ = true;
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     common::Status Session::prepare(const std::string &sql, const common::Params &typesSample,
@@ -485,38 +637,62 @@ namespace dbmw::core {
         // 预备语句也要过审计：借"预备"绕开黑名单等于给拦截开了后门。
         // 分类完全由 SQL 文本决定，与这里传的 OperationType 无关（见 sql_auditor）。
         if (const auto a = auditStatement(sql, common::OperationType::Query); !a.ok()) return a;
-        return (*h_)->prepare(sql, typesSample, out);
+        // M1 SPI 埋点：prepare 也是 SQL 入口（I9）。无 ResultSet / 无 affected。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Query, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Query,
+                           &typesSample, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, nullptr, [&] {
+            return (*h_)->prepare(sql, typesSample, out);
+        });
     }
 
     common::Status Session::executePrepared(const PreparedStatementHandle &h,
                                             const common::Params &params,
                                             common::ResultSet &out) const {
-        std::uint64_t rows = 0;
-        // 句柄是不透明令牌，上层拿不到它对应的 SQL 文本，观测里只能记占位模板——
-        // 预编译路径的观测重心在耗时与成败，SQL 文本在 prepare 那一步已经审过。
-        const auto status = observeSql(dataSource_, common::OperationType::Query, "<prepared>",
-                                       params, h_->get(), rows, [&] {
-            const auto result = (*h_)->executePrepared(h, params, out);
-            rows = out.rowCount();
-            return result;
+        // M1 SPI 埋点：会话内预编译执行入口（I9）。
+        // 句柄是不透明令牌，上层拿不到它对应的 SQL 文本，view.sql 用 "<prepared>" 占位——
+        // 实际 SQL 文本在 prepare 那一步已经审/埋过，此处仅以占位标记触发回调。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, "<prepared>", common::OperationType::Query, ctx);
+        ExecutionView view{dataSource_, "<prepared>", common::OperationType::Query,
+                           &params, &out, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, &out, nullptr, [&] {
+            std::uint64_t rows = 0;
+            const auto status = observeSql(dataSource_, common::OperationType::Query, "<prepared>",
+                                           params, h_->get(), rows, [&] {
+                const auto result = (*h_)->executePrepared(h, params, out);
+                rows = out.rowCount();
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     common::Status Session::executePrepared(const PreparedStatementHandle &h,
                                             const common::Params &params,
                                             std::int64_t &affected) const {
-        std::uint64_t rows = 0;
-        const auto status = observeSql(dataSource_, common::OperationType::Execute, "<prepared>",
-                                       params, h_->get(), rows, [&] {
-            const auto result = (*h_)->executePrepared(h, params, affected);
-            rows = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
-            if (result.ok()) didWrite_ = true;
-            return result;
+        // M1 SPI 埋点：会话内预编译执行入口（I9）。句柄不透明，view.sql = "<prepared>"。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, "<prepared>", common::OperationType::Execute, ctx);
+        ExecutionView view{dataSource_, "<prepared>", common::OperationType::Execute,
+                           &params, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, &affected, [&] {
+            std::uint64_t rows = 0;
+            const auto status = observeSql(dataSource_, common::OperationType::Execute, "<prepared>",
+                                           params, h_->get(), rows, [&] {
+                const auto result = (*h_)->executePrepared(h, params, affected);
+                rows = affected > 0 ? static_cast<std::uint64_t>(affected) : 0;
+                if (result.ok()) didWrite_ = true;
+                return result;
+            });
+            if (status.connectionBroken) h_->invalidate();
+            return status;
         });
-        if (status.connectionBroken) h_->invalidate();
-        return status;
     }
 
     // Cursor 析构：关游标（幂等），OwnsHandle 时 Handle 随 unique_ptr 析构归还连接。
@@ -540,18 +716,26 @@ namespace dbmw::core {
         // 会话内逐条审计（入口处还无 SQL）；限流已由 withSession/transaction 入口扣过，这里不重扣。
         // 传 Select（游标）而非 Query：让审计对其豁免 require_limit_select。
         if (const auto a = auditStatement(sql, common::OperationType::Select); !a.ok()) return a;
-        std::unique_ptr<ICursor> impl;
-        const auto status = (*h_)->openCursor(sql, params, opts, impl);
-        if (!status.ok()) return status;
-        if (!impl)
-            return common::Status::error(common::ErrorCode::CursorError,
-                                         "driver opened no cursor");
-        // 借而不占：连接仍归本 Session，游标随会话其余语句共享同一条连接
-        //（及若已开的事务快照）。BorrowedInSession 时 Cursor 的 handle_ 为空，
-        // close() 只关服务端游标、不归还连接，连接随 Session 析构归还。
-        out = std::make_unique<Cursor>(nullptr, std::move(impl), audit_,
-                                       Cursor::Binding::BorrowedInSession);
-        return common::Status::OK();
+        // M1 SPI 埋点：会话内游标入口（I9）。游标无 ResultSet，view.result=nullptr。
+        common::SqlContext ctx = common::ContextScope::current();
+        detail::runOnRoute(dataSource_, sql, common::OperationType::Select, ctx);
+        ExecutionView view{dataSource_, sql, common::OperationType::Select,
+                           &params, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, nullptr, [&] {
+            std::unique_ptr<ICursor> impl;
+            const auto status = (*h_)->openCursor(sql, params, opts, impl);
+            if (!status.ok()) return status;
+            if (!impl)
+                return common::Status::error(common::ErrorCode::CursorError,
+                                             "driver opened no cursor");
+            // 借而不占：连接仍归本 Session，游标随会话其余语句共享同一条连接
+            //（及若已开的事务快照）。BorrowedInSession 时 Cursor 的 handle_ 为空，
+            // close() 只关服务端游标、不归还连接，连接随 Session 析构归还。
+            out = std::make_unique<Cursor>(nullptr, std::move(impl), audit_,
+                                           Cursor::Binding::BorrowedInSession);
+            return common::Status::OK();
+        });
     }
 
     common::Status Session::begin() {
@@ -905,7 +1089,17 @@ namespace dbmw::core {
     common::Status DataSource::query(const std::string &sql, common::ResultSet &out) const
     {
         if (const auto g = preGate(sql, common::OperationType::Query); !g.ok()) return g;
-        return queryUngated(sql, out);
+        // M1 SPI 埋点：顶层入口（I9），不在 queryUngated 中重复。
+        common::SqlContext ctx;
+        detail::runOnRoute(name_, sql, common::OperationType::Query, ctx);
+        ExecutionView view{name_, sql, common::OperationType::Query,
+                           /*params*/ nullptr, /*result*/ &out,
+                           /*affected*/ 0, std::chrono::microseconds{0},
+                           common::Status::OK(), /*cached*/ false,
+                           /*depth*/ 0, ctx};
+        return runWithInterceptors(view, &out, nullptr, [&] {
+            return queryUngated(sql, out);
+        });
     }
 
     common::Status DataSource::queryUngated(const std::string &sql, common::ResultSet &out) const
@@ -958,7 +1152,15 @@ namespace dbmw::core {
                                      common::ResultSet &out) const
     {
         if (const auto g = preGate(sql, common::OperationType::Query); !g.ok()) return g;
-        return queryUngated(sql, params, out);
+        // M1 SPI 埋点：顶层入口（I9），不在 queryUngated 中重复。
+        common::SqlContext ctx;
+        detail::runOnRoute(name_, sql, common::OperationType::Query, ctx);
+        ExecutionView view{name_, sql, common::OperationType::Query,
+                           &params, &out, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, &out, nullptr, [&] {
+            return queryUngated(sql, params, out);
+        });
     }
 
     common::Status DataSource::queryUngated(const std::string &sql, const common::Params &params,
@@ -1007,7 +1209,15 @@ namespace dbmw::core {
     common::Status DataSource::execute(const std::string &sql, std::int64_t &affected) const
     {
         if (const auto g = preGate(sql, common::OperationType::Execute); !g.ok()) return g;
-        return executeUngated(sql, affected);
+        // M1 SPI 埋点：顶层入口（I9）。
+        common::SqlContext ctx;
+        detail::runOnRoute(name_, sql, common::OperationType::Execute, ctx);
+        ExecutionView view{name_, sql, common::OperationType::Execute,
+                           nullptr, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, &affected, [&] {
+            return executeUngated(sql, affected);
+        });
     }
 
     common::Status DataSource::executeUngated(const std::string &sql,
@@ -1058,7 +1268,15 @@ namespace dbmw::core {
                                        std::int64_t &affected) const
     {
         if (const auto g = preGate(sql, common::OperationType::Execute); !g.ok()) return g;
-        return executeUngated(sql, params, affected);
+        // M1 SPI 埋点：顶层入口（I9）。
+        common::SqlContext ctx;
+        detail::runOnRoute(name_, sql, common::OperationType::Execute, ctx);
+        ExecutionView view{name_, sql, common::OperationType::Execute,
+                           &params, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, &affected, [&] {
+            return executeUngated(sql, params, affected);
+        });
     }
 
     common::Status DataSource::executeUngated(const std::string &sql,
@@ -1119,7 +1337,15 @@ namespace dbmw::core {
     common::Status DataSource::execute(const std::string &sql, std::int64_t &affected,
                                        common::GeneratedKeys &out) const {
         if (const auto g = preGate(sql, common::OperationType::Execute); !g.ok()) return g;
-        return executeUngated(sql, affected, out);
+        // M1 SPI 埋点：顶层入口（I9）。
+        common::SqlContext ctx;
+        detail::runOnRoute(name_, sql, common::OperationType::Execute, ctx);
+        ExecutionView view{name_, sql, common::OperationType::Execute,
+                           nullptr, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, &affected, [&] {
+            return executeUngated(sql, affected, out);
+        });
     }
 
     common::Status DataSource::executeUngated(const std::string &sql, std::int64_t &affected,
@@ -1160,7 +1386,15 @@ namespace dbmw::core {
                                        std::int64_t &affected,
                                        common::GeneratedKeys &out) const {
         if (const auto g = preGate(sql, common::OperationType::Execute); !g.ok()) return g;
-        return executeUngated(sql, params, affected, out);
+        // M1 SPI 埋点：顶层入口（I9）。
+        common::SqlContext ctx;
+        detail::runOnRoute(name_, sql, common::OperationType::Execute, ctx);
+        ExecutionView view{name_, sql, common::OperationType::Execute,
+                           &params, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, &affected, [&] {
+            return executeUngated(sql, params, affected, out);
+        });
     }
 
     common::Status DataSource::executeUngated(const std::string &sql,
@@ -1219,7 +1453,15 @@ namespace dbmw::core {
     common::Status DataSource::query(const std::string &sql, const common::StreamParams &params,
                                      common::ResultSet &out) const {
         if (const auto g = preGate(sql, common::OperationType::Query); !g.ok()) return g;
-        return queryUngated(sql, params, out);
+        // M1 SPI 埋点：顶层入口（I9）。流式参数不进 ExecutionView.params。
+        common::SqlContext ctx;
+        detail::runOnRoute(name_, sql, common::OperationType::Query, ctx);
+        ExecutionView view{name_, sql, common::OperationType::Query,
+                           nullptr, &out, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, &out, nullptr, [&] {
+            return queryUngated(sql, params, out);
+        });
     }
 
     common::Status DataSource::queryUngated(const std::string &sql,
@@ -1251,7 +1493,15 @@ namespace dbmw::core {
                                        std::int64_t &affected,
                                        common::GeneratedKeys &out) const {
         if (const auto g = preGate(sql, common::OperationType::Execute); !g.ok()) return g;
-        return executeUngated(sql, params, affected, out);
+        // M1 SPI 埋点：顶层入口（I9）。流式参数不进 ExecutionView.params。
+        common::SqlContext ctx;
+        detail::runOnRoute(name_, sql, common::OperationType::Execute, ctx);
+        ExecutionView view{name_, sql, common::OperationType::Execute,
+                           nullptr, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, &affected, [&] {
+            return executeUngated(sql, params, affected, out);
+        });
     }
 
     common::Status DataSource::executeUngated(const std::string &sql,
@@ -1285,7 +1535,16 @@ namespace dbmw::core {
                                             const common::StreamParamBatch &batch,
                                             common::BatchResult &out) const {
         if (const auto g = preGate(sql, common::OperationType::Batch); !g.ok()) return g;
-        return executeBatchUngated(sql, batch, out);
+        // M1 SPI 埋点：顶层入口（I9）。批次结果（每行 affected）不进 view，
+        // BatchResult 含 vector，写入 view.result 会让接口误把它当 ResultSet 处理。
+        common::SqlContext ctx;
+        detail::runOnRoute(name_, sql, common::OperationType::Batch, ctx);
+        ExecutionView view{name_, sql, common::OperationType::Batch,
+                           nullptr, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, nullptr, [&] {
+            return executeBatchUngated(sql, batch, out);
+        });
     }
 
     common::Status DataSource::executeBatchUngated(const std::string &sql,
@@ -1316,7 +1575,15 @@ namespace dbmw::core {
                                          const common::RowCallback &callback,
                                          std::uint64_t &rows) const {
         if (const auto g = preGate(sql, common::OperationType::Stream); !g.ok()) return g;
-        return queryEachUngated(sql, params, callback, rows);
+        // M1 SPI 埋点：顶层入口（I9）。流式无 ResultSet，view.result=nullptr。
+        common::SqlContext ctx;
+        detail::runOnRoute(name_, sql, common::OperationType::Stream, ctx);
+        ExecutionView view{name_, sql, common::OperationType::Stream,
+                           &params, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, nullptr, [&] {
+            return queryEachUngated(sql, params, callback, rows);
+        });
     }
 
     common::Status DataSource::queryEachUngated(const std::string &sql,
@@ -1350,7 +1617,15 @@ namespace dbmw::core {
                                             const common::ParamBatch &batch,
                                             common::BatchResult &out) const {
         if (const auto g = preGate(sql, common::OperationType::Batch); !g.ok()) return g;
-        return executeBatchUngated(sql, batch, out);
+        // M1 SPI 埋点：顶层入口（I9）。批次结果不进 view（见 StreamParamBatch 版注释）。
+        common::SqlContext ctx;
+        detail::runOnRoute(name_, sql, common::OperationType::Batch, ctx);
+        ExecutionView view{name_, sql, common::OperationType::Batch,
+                           nullptr, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, nullptr, [&] {
+            return executeBatchUngated(sql, batch, out);
+        });
     }
 
     common::Status DataSource::openCursor(const std::string &sql, const common::Params &params,
@@ -1373,7 +1648,16 @@ namespace dbmw::core {
         // 且可能跨事务快照）。传 Select（游标）而非 Query：SqlAuditor::check 据此对游标
         // 豁免 require_limit_select——游标本就是分批消费，强制 LIMIT 会废掉其全量扫描用法。
         if (const auto g = preGate(sql, common::OperationType::Select); !g.ok()) return g;
-        return openCursorUngated(sql, params, effective, out);
+        // M1 SPI 埋点：顶层入口（I9）。游标无 ResultSet，view.result=nullptr；
+        // affected 非游标语义，亦不暴露。
+        common::SqlContext ctx;
+        detail::runOnRoute(name_, sql, common::OperationType::Select, ctx);
+        ExecutionView view{name_, sql, common::OperationType::Select,
+                           &params, nullptr, 0, std::chrono::microseconds{0},
+                           common::Status::OK(), false, 0, ctx};
+        return runWithInterceptors(view, nullptr, nullptr, [&] {
+            return openCursorUngated(sql, params, effective, out);
+        });
     }
 
     common::Status DataSource::openCursorUngated(const std::string &sql, const common::Params &params,
@@ -1580,19 +1864,25 @@ namespace dbmw::core {
     common::Status DataSource::transaction(const SessionFn &fn) const
     {
         if (const auto g = gateSession(); !g.ok()) return g;
-        return transactionInternal(common::TransactionOptions{}, fn, kUsePoolDefault, readOnly_);
+        // M1 SPI（I9）：事务入口不直接发 SQL 拦截器回调——
+        // 事务级 SQL 是 Session::query 等子语句，traceId 由 ctx 透传。
+        // 这里只推送一次 ctx，事务回调里 Session 子语句读栈顶即可。
+        return transactionInternal(common::TransactionOptions{}, fn,
+                                   kUsePoolDefault, readOnly_);
     }
 
     common::Status DataSource::transaction(const SessionFn &fn,
                                            const std::chrono::milliseconds borrowTimeout) const
     {
         if (const auto g = gateSession(); !g.ok()) return g;
+        // M1 SPI（I9）：见上。
         return transactionInternal(common::TransactionOptions{}, fn, borrowTimeout, readOnly_);
     }
 
     common::Status DataSource::transaction(const common::TransactionOptions &options,
                                            const SessionFn &fn) const {
         if (const auto g = gateSession(); !g.ok()) return g;
+        // M1 SPI（I9）：见上。
         return transactionInternal(options, fn, kUsePoolDefault, readOnly_);
     }
 

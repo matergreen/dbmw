@@ -1,4 +1,5 @@
 #include "dbmw/common/observer.h"
+#include "dbmw/common/context.h"
 #include "dbmw/common/logger.h"
 
 #include <algorithm>
@@ -383,6 +384,29 @@ namespace dbmw::common {
 
             const bool slowEnabled = config.slow_sql.enabled;
             const bool logEnabled = config.sql_log.enabled;
+
+            // M2 追踪上下文（M1 已通过 ContextScope 把 traceId/spanId 送到中间件
+            // 任意一层）。emitSql 是观测链路上第一条进入的中间件函数（在驱动
+            // 调用前后都会有 sentinel 调用），从这里集中读一次填进 event 与
+            // 之后的 SlowSqlRecord，保证后续所有出口（observer / 日志 / 慢 SQL
+            // 聚合）拿到同一份 trace。
+            //
+            // 设计取舍：traceId 不自动生成——没有调用方上下文时就不挂 traceId
+            // （与 nextSpanId "不发幽灵 span" 同源）；spanId 沿用调用方栈顶的，
+            // 调用方未填则按语句自动生成 16 hex 子跨度，便于在调用方不感知
+            // 追踪的情况下，按"次请求 = 多条 SQL"颗粒度对齐链路。
+            {
+                const SqlContext &ctx = ContextScope::current();
+                if (!ctx.traceId.empty()) event.traceId = ctx.traceId;
+                if (!ctx.spanId.empty()) {
+                    event.spanId = ctx.spanId;
+                } else if (!event.traceId.empty()) {
+                    // 仅在有 trace 时才生成子跨度，避免在没有 trace 的窗口里
+                    // 制造"无主 span"混淆聚合视图。
+                    event.spanId = nextSpanId();
+                }
+            }
+
             // P1-1：观测全关（无观察者、慢 SQL 与 SQL 日志都关）时，
             // 直接返回，省掉结构化扫描和 fingerprint 的 O(n) 开销。
             // 只要注册了观察者，仍照常回调（不影响数据库语义）。
@@ -487,6 +511,8 @@ namespace dbmw::common {
                     record.duration = event.duration;
                     record.errorCode = event.status.code;
                     record.sqlState = event.status.sqlState;
+                    record.traceId = event.traceId;   // M2：与 OperationEvent 同源
+                    record.spanId = event.spanId;
                     if (g_recentSlow.size() >= static_cast<std::size_t>(
                             config.slow_sql.recent_capacity))
                         g_recentSlow.pop_front();
@@ -504,8 +530,12 @@ namespace dbmw::common {
                         << " duration_ms=" << durationMs
                         << " rows=" << event.rowCount
                         << " status=" << errorCodeToString(event.status.code)
-                        << " fingerprint=" << event.sqlFingerprint
-                        << " statement=" << displaySql;
+                        << " fingerprint=" << event.sqlFingerprint;
+                // M2：把 trace 附在日志行末尾，便于按 trace 拉一段窗口。
+                // 只在有值时输出，避免给无 trace 的传统链路膨胀字数。
+                if (!event.traceId.empty()) message << " trace=" << event.traceId;
+                if (!event.spanId.empty()) message << " span=" << event.spanId;
+                message << " statement=" << displaySql;
                 Logger::log(parseLevel(config.sql_log.level), message.str());
             }
 

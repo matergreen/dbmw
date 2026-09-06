@@ -309,6 +309,24 @@ namespace dbmw::config {
         }
     }
 
+    // ---- SPI 拦截器总开关（v0.4.0 M1）----
+    if (j.contains("interceptors")) {
+        if (!j["interceptors"].is_object()) {
+            error = "interceptors must be an object";
+            return false;
+        }
+        const auto &ic = j["interceptors"];
+        out.interceptors.enabled = ic.value("enabled", out.interceptors.enabled);
+        // 当前仅暴露 enabled——注册顺序 / 列表必须在代码中显式调 API。
+        // 这里拒收任何其他字段，避免配置层/代码层语义漂移。
+        for (auto it = ic.begin(); it != ic.end(); ++it) {
+            if (it.key() != "enabled") {
+                error = "unknown interceptors field: " + it.key();
+                return false;
+            }
+        }
+    }
+
     // ---- 异步执行器 ----
     if (j.contains("async")) {
         if (!j["async"].is_object()) {
