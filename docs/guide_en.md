@@ -620,6 +620,40 @@ dbmw::DBMW::removeDataSource("legacy_leaf");           // then remove the leaf
 
 Concurrency safety is provided by `mtx_` — multiple threads calling `addDataSource` with different names do not interfere; concurrent same-name calls let the later caller fail gracefully with `ConfigError` — **neither caller** believes it succeeded. See `tests/dbmw_dynamic_test.cpp` for the full concurrent-behavior matrix (79 assertions across 16 scenarios covering add/remove/group/ack/concurrency/grace).
 
+## Idempotency declaration (v0.4.0 M5: let the caller decide whether writes may retry)
+
+Retries were previously guessed by the engine **from the statement type**: whether `execute` retries depended on the `retry_writes` config. The problem is the engine can only guess — the caller knows. An `UPDATE ... SET balance = balance - 100` is an `Execute` (looks retryable) but is non-idempotent; an `UPDATE ... SET status='paid' WHERE id=?` is idempotent. M5 hands the decision back to the caller via the three-state `SqlContext::idempotency`:
+
+| Declaration | Meaning | Effect on write retries |
+| --- | --- | --- |
+| `Unspecified` (default) | not declared | existing logic: `retry_writes` config + Single/Multi |
+| `Idempotent` | declared idempotent | retries writes on connection-class errors, **even if** `retry_writes=false` |
+| `NonIdempotent` | declared non-idempotent | never retries writes, **even if** `retry_writes=true` |
+
+Using an **enum instead of `bool`** is deliberate: `bool idempotent=false` cannot distinguish "not declared" from "explicitly declared non-idempotent". `Unspecified` guarantees **no declaration = status quo** — adding this feature changes no existing behavior.
+
+```cpp
+// Wrap one request entry point in a ContextScope; the whole call chain
+// (sync / async / transaction) inherits it:
+{
+    dbmw::common::ContextScope scope({.idempotency = dbmw::common::Idempotency::Idempotent});
+    ds->execute("UPDATE accounts SET status='paid' WHERE id=?", affected); // retries on failure
+}
+
+{
+    dbmw::common::ContextScope scope({.idempotency = dbmw::common::Idempotency::NonIdempotent});
+    ds->execute("UPDATE accounts SET balance=balance-100 WHERE id=?", affected); // never retries
+}
+```
+
+**Decision priority (high→low)**: `NonIdempotent` > `Idempotent` > `Unspecified`. The declaration only affects "whether writes retry" — it does not change:
+
+- **Read paths**: reads are replayable, so `query` still retries per `retry_writes`/max_attempts as before;
+- **The no-retry-inside-transactions invariant (I4)** — transactional statements never enter the retry loop;
+- **Non-retryable errors** (business / constraint violations) still don't retry — the declaration only overrides the "connection-class retryable error" tier.
+
+The async path is identical in source: `async::execute`'s `maxAttempts` reads the stack-top `ContextScope` snapshot taken at submit time (`entryCtx.idempotency`), using the same priority table as the sync `resolveWriteAttempts`. See `tests/dbmw_idempotency_test.cpp` for the behavior matrix (19 assertions across 9 scenarios covering three states × sync/async × reads-unaffected).
+
 ## Async API (v0.2.0: callbacks / futures / coroutines)
 
 The three calling styles share one execution pipeline — governance gates (audit / rate limit / circuit breaker / cache), retry backoff, statement timeout, cancellation — and differ only in how results are delivered. Enable `async` in the config:

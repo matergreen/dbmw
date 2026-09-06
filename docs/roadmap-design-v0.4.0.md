@@ -52,7 +52,7 @@
 | 影子库路由 | 缺失 | ✅ 确属缺失 | 从零设计（可复用组路由框架） |
 | 动态数据源 | 缺失 | ✅ 确属缺失（现仅有 `init()` 整体热替换） | 从零设计 |
 | 结果脱敏 | 缺失 | ✅ 确属缺失（现有仅为"驱动错误脱敏"，防日志泄密） | 从零设计 |
-| 幂等声明 | 缺失 | ✅ 确属缺失（重试现由引擎按语句类型推断 `Single`/`Multi`） | 从零设计 |
+| 幂等声明 | 缺失 | ✅ 已落地（v0.4.0 M5）：`Idempotency` 三态声明叠加到同步 `resolveWriteAttempts` + 异步 `maxAttempts` | 无 |
 | 分库分表 / 分片（含轻量分片） | 缺失 | ✅ 确属缺失 | **永不实现**（§11，维护者 2026-09-06 决策） |
 | 分布式事务（XA / 2PC / Saga） | 缺失 | ✅ 确属缺失 | **永不实现**（§11） |
 | 跨数据源一致性保证 | 缺失 | ✅ 确属缺失 | **永不实现**（§11） |
@@ -129,7 +129,7 @@
 | M2 | 追踪上下文 | 成本最低、价值最直接。中间件是所有 SQL 的必经之路，加一个上下文槽即可让日志/慢 SQL/指标全部可串联 |
 | M3 | 指标导出增强 | 依赖 M2（指标需要 trace 维度）；机制已有，只是补字段与出口 |
 | M4 | 动态数据源 | ✅ **已落地**（2026-09）——`addDataSource/removeDataSource/addGroup/removeGroup` + facade 透传 + 79 项单测。独立于 SPI，改动面集中在 `DatabaseManager::init` 的替换逻辑，宜早做以暴露生命周期问题 |
-| M5 | 幂等声明 | 独立小改动，把重试语义从"引擎猜"变成"调用方声明" |
+| M5 | 幂等声明 | ✅ **已落地**（2026-09）——`context.h` 三态枚举 + 同步 `resolveWriteAttempts` + 异步 `maxAttempts` 接入 + 19 项单测。独立小改动，把重试语义从"引擎猜"变成"调用方声明" |
 | M6 | 影子库路由 | 依赖 M1（路由决策）+ 复用现有组路由框架 |
 | M7 | 结果脱敏 | 依赖 M1（结果改写）。之所以排后：它触碰结果集与缓存（I10），需要前序能力稳定后再动 |
 | M8 | 读后写增强 | 功能已存在（§1.3），属优化项，排最后无风险 |
@@ -612,6 +612,31 @@ public:
 |---|---|
 | 调用方误声明幂等导致重复写 | 文档强调"声明即承诺"；建议配合唯一键/去重表使用 |
 | 与 `retry_writes` 配置冲突 | §7.2 的优先级表已明确，声明覆盖配置 |
+
+### §7.5 实施状态（v0.4.0）
+
+**已落地**（提交于 `dev` 分支，M5 单独 commit）：
+
+1. `include/dbmw/common/context.h`：`Idempotency` 枚举与 `SqlContext::idempotency` 字段**此前已在 M1/M2 一并就位**（SPI 上下文槽），M5 无需改此文件。
+2. `src/core/database_manager.cpp`：新增文件级助手 `resolveWriteAttempts(const config::RetryConfig&)`，4 处写重试循环（`executeUngated` 的无参 / 带参 / 生成键无参 / 生成键带参，行 1246/1302/1363/1414）由
+   `retry_.retry_writes ? std::max(1, retry_.max_attempts) : 1`
+   改为 `resolveWriteAttempts(retry_)`。读路径（query / cursor）的 `std::max(1, retry_.max_attempts)` **不动**——声明只影响写。
+3. `src/async/async_engine.cpp`：`maxAttempts` 增加 `common::Idempotency idem` 形参，在 `WriteRetries` 分支按同一张优先级表覆盖；调用点（行 648）传入 `ctx->entryCtx.idempotency`（submit 时刻栈顶 ctx 快照）。`Single`（queryEach/executeBatch）与 `ReadRetries` 不受声明影响。
+
+**决策优先级（与 §7.2 一致）**：
+
+```
+NonIdempotent 且 WriteRetries → attempts = 1          // 绝不重试写
+Idempotent    且 WriteRetries → attempts = max(1, max_attempts)  // 覆盖 retry_writes=false
+其余                        → 既有逻辑（retry_writes + Single/Multi）
+```
+
+**测试**：`tests/dbmw_idempotency_test.cpp`（19 项断言 / 9 场景全过）——覆盖三态 × 同步/异步，以及"读路径不受声明影响"与"非可重试错误照旧不重试"两个边界。
+
+**偏差与遗留**：
+
+- 写缓冲补发线程（后台重放）不携带调用方 `ContextScope`，重放时 `idempotency` 为 `Unspecified`，走既有 `retry_.retry_writes`——与 M4 写缓冲"不重试、重放=重复写入"的语义一致，无需为补发线程快照上下文。
+- `queryEach` / `executeBatch`（`RetryMode::Single`）即便声明 `Idempotent` 也不重试——副作用/流不可重放，属设计内约束。
 
 ---
 

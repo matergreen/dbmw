@@ -59,6 +59,24 @@ namespace dbmw::core {
         //   onCompletion（恰好一次）。
         //   不构造、不包装、绝不重抛；拦截器异常已被 detail 层 try/catch 吞掉（I11）。
         //
+        // M5：把幂等声明叠加到既有写重试配置上（见 docs/roadmap-design-v0.4.0.md §7）。
+        //
+        // 决策优先级（高→低）：
+        //   1. NonIdempotent → 绝不重试写（即便 retry_writes=true，attempts 强制为 1）。
+        //   2. Idempotent    → 允许重试写，即使 retry_writes=false 也按 max_attempts 重试。
+        //   3. Unspecified   → 走既有逻辑（retry_writes 配置决定）。
+        //
+        // 声明只影响"是否重试写"，不改变读路径（读本身可重放）与事务内不重试
+        // 这条不变量（I4）——事务内语句不进 executeUngated 的重试循环。
+        // 上下文取自线程栈顶 ContextScope；栈空时为 default（Unspecified），
+        // 与"不声明即保持现状"完全一致。
+        int resolveWriteAttempts(const config::RetryConfig &retry) {
+            const auto idem = common::ContextScope::current().idempotency;
+            if (idem == common::Idempotency::NonIdempotent) return 1;
+            if (idem == common::Idempotency::Idempotent) return std::max(1, retry.max_attempts);
+            return retry.retry_writes ? std::max(1, retry.max_attempts) : 1;
+        }
+
         // 调用方负责：构造 ctx / 调用 runOnRoute / 构造 view / 决定 result 与
         // affected 是否对外暴露（nullptr/0 = 不暴露）。
         template <typename Fn>
@@ -1243,7 +1261,7 @@ namespace dbmw::core {
                 buffered);
         }
         common::Status status;
-        const int attempts = retry_.retry_writes ? std::max(1, retry_.max_attempts) : 1;
+        const int attempts = resolveWriteAttempts(retry_);
         for (int attempt = 1; attempt <= attempts; ++attempt) {
             if (const auto gate = beforeAttempt(); !gate.ok()) return gate;
             affected = 0;
@@ -1299,7 +1317,7 @@ namespace dbmw::core {
                 buffered);
         }
         common::Status status;
-        const int attempts = retry_.retry_writes ? std::max(1, retry_.max_attempts) : 1;
+        const int attempts = resolveWriteAttempts(retry_);
         for (int attempt = 1; attempt <= attempts; ++attempt) {
             if (const auto gate = beforeAttempt(); !gate.ok()) return gate;
             affected = 0;
@@ -1360,7 +1378,7 @@ namespace dbmw::core {
                 {}); // 不入写缓冲：见本节开头
         }
         common::Status status;
-        const int attempts = retry_.retry_writes ? std::max(1, retry_.max_attempts) : 1;
+        const int attempts = resolveWriteAttempts(retry_);
         for (int attempt = 1; attempt <= attempts; ++attempt) {
             if (const auto gate = beforeAttempt(); !gate.ok()) return gate;
             affected = 0;
@@ -1411,7 +1429,7 @@ namespace dbmw::core {
                 {}); // 不入写缓冲：见本节开头
         }
         common::Status status;
-        const int attempts = retry_.retry_writes ? std::max(1, retry_.max_attempts) : 1;
+        const int attempts = resolveWriteAttempts(retry_);
         for (int attempt = 1; attempt <= attempts; ++attempt) {
             if (const auto gate = beforeAttempt(); !gate.ok()) return gate;
             affected = 0;

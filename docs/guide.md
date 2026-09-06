@@ -668,6 +668,39 @@ dbmw::DBMW::removeDataSource("legacy_leaf");           // 再卸叶子
 
 并发安全由 `mtx_` 保证——多线程同时 addDataSource 不同名互不干扰；同名并发里后到者以 `ConfigError` 优雅失败，**不会**让两个调用者都以为自己成功。详细并发行为见 `tests/dbmw_dynamic_test.cpp`（79 项断言，16 个场景覆盖 add/remove/group/ack/并发/grace）。
 
+## 幂等声明（v0.4.0 M5：让调用方决定写是否可重试）
+
+重试原本由引擎**按语句类型猜**：`execute` 是否重试取决于 `retry_writes` 配置。问题在于引擎只能猜、调用方才知道——一条 `UPDATE ... SET balance = balance - 100` 是 `Execute`（类型上看可重试），但它非幂等；而 `UPDATE ... SET status='paid' WHERE id=?` 是幂等的。M5 用 `SqlContext::idempotency` 三态声明把决策权交还调用方：
+
+| 声明 | 语义 | 对写重试的影响 |
+| --- | --- | --- |
+| `Unspecified`（默认） | 未声明 | 走既有逻辑：`retry_writes` 配置 + Single/Multi |
+| `Idempotent` | 声明幂等 | 允许在连接类错误上自动重试写，**即使** `retry_writes=false` |
+| `NonIdempotent` | 声明非幂等 | 任何情况下都不重试写，**即使** `retry_writes=true` |
+
+用**枚举而非 `bool`** 是关键：`bool idempotent=false` 无法区分"未声明"与"显式声明非幂等"。`Unspecified` 保证**不声明即保持现状**——引入该特性不改变任何既有行为。
+
+```cpp
+// 一次业务请求入口包一层 ContextScope，整段调用链（同步/异步/事务）都透传：
+{
+    dbmw::common::ContextScope scope({.idempotency = dbmw::common::Idempotency::Idempotent});
+    ds->execute("UPDATE accounts SET status='paid' WHERE id=?", affected); // 失败会重试
+}
+
+{
+    dbmw::common::ContextScope scope({.idempotency = dbmw::common::Idempotency::NonIdempotent});
+    ds->execute("UPDATE accounts SET balance=balance-100 WHERE id=?", affected); // 绝不重试
+}
+```
+
+**决策优先级（高→低）**：`NonIdempotent` > `Idempotent` > `Unspecified`。声明只影响"是否重试写"，不改变：
+
+- **读路径**：读本身可重放，`query` 仍按 `retry_writes`/max_attempts 照常重试；
+- **事务内不重试**这条不变量（I4）——事务内语句根本不进重试循环；
+- **非可重试错误**（业务/约束冲突）照旧不重试——声明只覆盖"连接类可重试错误"这一档。
+
+异步路径同源：`async::execute` 的 `maxAttempts` 读取 submit 时刻栈顶 `ContextScope` 的快照（`entryCtx.idempotency`），与同步 `resolveWriteAttempts` 用同一张优先级表。详细行为见 `tests/dbmw_idempotency_test.cpp`（19 项断言，9 个场景覆盖三态 × 同步/异步 × 读路径不受影响）。
+
 ## 异步 API（v0.2.0：回调 / future / 协程）
 
 三种调用形态共享同一条执行管线——治理闸门（审计/限流/熔断/缓存）、重试退避、语句超时、取消——只是结果交付方式不同。在配置中开启 `async`：

@@ -34,6 +34,12 @@ target_link_libraries(dbmw_exporters_test PRIVATE dbmw)
 add_executable(dbmw_dynamic_test dbmw_dynamic_test.cpp)
 target_link_libraries(dbmw_dynamic_test PRIVATE dbmw)
 
+# M5 幂等声明单测：Idempotency 三态叠加到重试决策（同步 resolveWriteAttempts
+# + 异步 maxAttempts）。通过"注入 N 次可重试失败 + 数 execute/query 调用次数"
+# 验证 attempts，直接命中真实分支。无真实数据库依赖。
+add_executable(dbmw_idempotency_test dbmw_idempotency_test.cpp)
+target_link_libraries(dbmw_idempotency_test PRIVATE dbmw)
+
 # 真实数据库集成测试默认不构建，避免普通单元测试依赖外部服务；
 # 开启时由各 DBMW_TEST_* 环境变量提供连接信息，测试只操作自己的临时对象。
 if(DBMW_BUILD_INTEGRATION_TESTS AND DBMW_ENABLE_POSTGRES)
@@ -73,6 +79,8 @@ if(Threads_FOUND)
     target_link_libraries(dbmw_interceptor_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_observability_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_exporters_test PRIVATE Threads::Threads)
+    target_link_libraries(dbmw_dynamic_test PRIVATE Threads::Threads)
+    target_link_libraries(dbmw_idempotency_test PRIVATE Threads::Threads)
     if(TARGET dbmw_coro_test)
         target_link_libraries(dbmw_coro_test PRIVATE Threads::Threads)
     endif()
@@ -94,3 +102,4 @@ add_test(NAME dbmw_interceptor_test COMMAND dbmw_interceptor_test)
 add_test(NAME dbmw_observability_test COMMAND dbmw_observability_test)
 add_test(NAME dbmw_exporters_test COMMAND dbmw_exporters_test)
 add_test(NAME dbmw_dynamic_test COMMAND dbmw_dynamic_test)
+add_test(NAME dbmw_idempotency_test COMMAND dbmw_idempotency_test)

@@ -645,7 +645,8 @@ namespace dbmw::async {
 
                 // 1) 目标内重试（同步语义：仅 retryable 才重试）。
                 if (st.retryable && target
-                    && ctx->attempt < maxAttempts(ctx->policy, *target)) {
+                    && ctx->attempt < maxAttempts(ctx->policy, *target,
+                                                  ctx->entryCtx.idempotency)) {
                     const auto delay = target->retryDelay(ctx->attempt);
                     scheduleNext(ctx, delay);
                     return;
@@ -708,8 +709,23 @@ namespace dbmw::async {
                 ex->postAfter([ctx] { step1Statement(ctx); }, delay);
             }
 
+            // M5：把幂等声明叠加到既有重试决策上（见 docs/roadmap-design-v0.4.0.md §7）。
+            // idem 来自调用线程栈顶 ctx 的快照（StatementOp::entryCtx），语义与
+            // 同步路径 database_manager.cpp 的 resolveWriteAttempts 完全一致：
+            //   NonIdempotent → 写强制 1 次（绝不重试）；
+            //   Idempotent    → 写按 max_attempts 重试（覆盖 retry_writes=false）；
+            //   Unspecified   → 走既有逻辑。
             static int maxAttempts(const StatementPolicy &policy,
-                                   const core::DataSource &target) {
+                                   const core::DataSource &target,
+                                   const common::Idempotency idem) {
+                if (idem == common::Idempotency::NonIdempotent
+                    && policy.retry == RetryMode::WriteRetries) {
+                    return 1;
+                }
+                if (idem == common::Idempotency::Idempotent
+                    && policy.retry == RetryMode::WriteRetries) {
+                    return std::max(1, target.retry_.max_attempts);
+                }
                 switch (policy.retry) {
                     case RetryMode::ReadRetries:
                         return std::max(1, target.retry_.max_attempts);
