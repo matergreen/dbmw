@@ -46,6 +46,13 @@ target_link_libraries(dbmw_idempotency_test PRIVATE dbmw)
 add_executable(dbmw_shadow_test dbmw_shadow_test.cpp)
 target_link_libraries(dbmw_shadow_test PRIVATE dbmw)
 
+# M7 结果脱敏单测：SPI afterExecution 改写 view.result → 置位
+# rs.transformed=true → cacheStore/queryUngated 守卫硬拦截，I10 落地；
+# 缓存命中路径（同步包在 runWithInterceptors 内，异步提交时手动调）
+# 仍要走 afterExecution，否则脱敏被绕过（§9.4 风险行）。无真实数据库依赖。
+add_executable(dbmw_redaction_test dbmw_redaction_test.cpp)
+target_link_libraries(dbmw_redaction_test PRIVATE dbmw)
+
 # 真实数据库集成测试默认不构建，避免普通单元测试依赖外部服务；
 # 开启时由各 DBMW_TEST_* 环境变量提供连接信息，测试只操作自己的临时对象。
 if(DBMW_BUILD_INTEGRATION_TESTS AND DBMW_ENABLE_POSTGRES)
@@ -88,6 +95,7 @@ if(Threads_FOUND)
     target_link_libraries(dbmw_dynamic_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_idempotency_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_shadow_test PRIVATE Threads::Threads)
+    target_link_libraries(dbmw_redaction_test PRIVATE Threads::Threads)
     if(TARGET dbmw_coro_test)
         target_link_libraries(dbmw_coro_test PRIVATE Threads::Threads)
     endif()
@@ -111,3 +119,4 @@ add_test(NAME dbmw_exporters_test COMMAND dbmw_exporters_test)
 add_test(NAME dbmw_dynamic_test COMMAND dbmw_dynamic_test)
 add_test(NAME dbmw_idempotency_test COMMAND dbmw_idempotency_test)
 add_test(NAME dbmw_shadow_test COMMAND dbmw_shadow_test)
+add_test(NAME dbmw_redaction_test COMMAND dbmw_redaction_test)

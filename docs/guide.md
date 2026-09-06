@@ -763,6 +763,61 @@ ds->query("SELECT * FROM products ...", rs);        // 落到 shadow_db（命中
 
 校验放在 `resolveShadows`（在 `init()` 与 `addGroup()` 后、对外可见前）。详细行为与代码片段见 `tests/dbmw_shadow_test.cpp`（39 项断言，10 个场景覆盖同步 / 异步 / 缓存 / 写缓冲 / 配置校验所有分支）。
 
+## 结果脱敏（v0.4.0 M7：按角色 / 租户掩码结果集）
+
+合规场景（手机号、身份证、银行卡）需要在结果集返回前按角色 / 租户做掩码。**dbmw 不内置任何脱敏规则**——规则是业务 / 合规概念，内置等于替用户做合规决策；只提供 SPI 钩子和 I10 守卫（脱敏结果绝不进缓存）。
+
+**改写时机**：SPI `afterExecution`（M1 §3.3）拿到 `view.result`（`common::ResultSet*`，可改写）。改写完成后置位 `view.result->transformed = true`，**这是中间件识别"已被脱敏"的唯一信号**。
+
+**示例**（业务自己实现 `ISqlInterceptor`）：
+
+```cpp
+class MaskingInterceptor : public dbmw::core::ISqlInterceptor {
+public:
+    void onRoute(const std::string&, const std::string&,
+                 dbmw::common::OperationType, dbmw::common::SqlContext&) override {}
+
+    dbmw::common::Status beforeExecution(const dbmw::core::ExecutionView&) override {
+        return dbmw::common::Status::OK();
+    }
+
+    void afterExecution(const dbmw::core::ExecutionView &view) override {
+        if (!view.result) return;                  // 非查询（写 / 批 / 游标）不动
+        // 这里做你的脱敏：按列名 / 列下标 / 值模式识别敏感字段并掩码
+        for (auto &row : view.result->rows()) {
+            // ... row.data() 遍历每个 cell，按合规策略替换 ...
+        }
+        // 关键：标记已被改写。中间件会守卫这一结果不进查询缓存。
+        view.result->transformed = true;
+    }
+
+    void onCompletion(const dbmw::core::ExecutionView&) override {}
+};
+
+// 在 DBMW::init 之前注册：
+dbmw::DBMW::addInterceptor(std::make_shared<MaskingInterceptor>());
+dbmw::core::InterceptorRegistry::setEnabled(true);
+```
+
+**I10 守卫的硬约束**：置位 `transformed=true` 后，dbmw 在三处硬拦截入缓存：
+
+| 位置 | 守卫 |
+|---|---|
+| `DataSource::queryUngated`（同步） | `if (caching && !out.transformed) QueryCache::put(...)` |
+| `DataSource::cacheStore`（同步） | `if (rows.transformed) return;` |
+| `async::query` 的 `step2Statement`（异步） | `if (policy.cacheable && !ctx->entryCtx.shadow) target->cacheStore(...)` ——`cacheStore` 内部守卫命中 |
+
+**为什么脱敏结果不能进缓存**：缓存存的是原始结果，脱敏是角色 / 租户相关的视图。把脱敏结果写进缓存，下一个不同权限的用户会读到上一个用户的视图——**跨用户数据泄漏**。
+
+**缓存命中路径仍要走 `afterExecution`**（§9.4 风险行）：缓存里是原始数据（被守卫拦下，不可能有 transformed=true 的版本），所以缓存命中后必须重新跑一遍 `afterExecution` 才能得到当前用户的视图。同步路径天然被 `runWithInterceptors` 包住；异步路径在 submit 时手动构造视图调一次 `detail::runAfterExecution(view)`。
+
+**业务改写 `ResultSet` 的限制**：`rows()` / `row.data()` 当前返回 `const &`，不可原地改写 cell。如需掩码：
+
+- 业务在自己的拦截器里缓存原始 `Row.data()` 索引，按列名读 + 写自己的 `map<string, Value>`；
+- 或 dbmw 提供 `ResultSet::transformRow(name, fn)` 之类的可变入口（M7 仅落地标记 + 守卫，没扩 API 面）。
+
+不变量保留：**数据进入拦截器 → 数据出拦截器 → 缓存守卫**全程只看 `transformed` 标记位。详细行为与代码片段见 `tests/dbmw_redaction_test.cpp`（38 项断言，5 个场景覆盖同步 / 异步 / 缓存命中 / I10 守卫 / 改写标记）。
+
 ## 异步 API（v0.2.0：回调 / future / 协程）
 
 三种调用形态共享同一条执行管线——治理闸门（审计/限流/熔断/缓存）、重试退避、语句超时、取消——只是结果交付方式不同。在配置中开启 `async`：

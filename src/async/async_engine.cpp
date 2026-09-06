@@ -465,6 +465,24 @@ namespace dbmw::async {
                             QueryResult r;
                             r.status = common::Status::OK();
                             r.rows = std::move(cached);
+                            // M7（§9.4 风险行 + I10）：缓存命中**同样要走
+                            // afterExecution**——缓存存的是原始结果，脱敏是
+                            // 角色/租户视图，命中路径漏调会让缓存绕过脱敏。
+                            // 同步路径天然被 runWithInterceptors 包住；异步
+                            // 提交时直接走 deliverResult 是 I9 之外的特例，
+                            // 这里手动构造视图补一次 afterExecution。
+                            // 注：interceptorDepth 在 safeCall 内被计数，
+                            // 不需 RAII guard（仅 afterExecution 不需要 onCompletion）。
+                            {
+                                core::ExecutionView view{root->name(), sql,
+                                    common::OperationType::Query,
+                                    &params, &r.rows, 0,
+                                    std::chrono::microseconds{0},
+                                    common::Status::OK(),
+                                    /*cached*/ true, /*depth*/ 0,
+                                    ctx->entryCtx};
+                                core::detail::runAfterExecution(view);
+                            }
                             deliverResult(std::move(ctx->cb), std::move(r));
                             return doneHandle(); // 缓存命中：零驱动调用
                         }

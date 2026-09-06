@@ -87,6 +87,12 @@ namespace dbmw::common {
         [[nodiscard]] bool empty() const { return rows_.empty(); }
         void clear() { fields_.clear(); rows_.clear(); }
 
+        // M7（§9.2 + I10）：SPI afterExecution 改写结果后置位。命中后
+        // 路由层 cacheStore 硬拦截——脱敏是角色/租户相关视图，把脱敏
+        // 结果写进缓存会让下一个不同权限的用户读到上一个的视图，
+        // 构成跨用户数据泄漏。默认 false，业务/合规拦截器置 true。
+        bool transformed = false;
+
     private:
         std::vector<std::string> fields_;
         std::vector<Row> rows_;

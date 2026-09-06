@@ -716,6 +716,62 @@ ds->query("SELECT * FROM products ...", rs);        // lands in shadow_db (prima
 
 Validation runs in `resolveShadows` (after `init()` / `addGroup()`, before externally visible). See `tests/dbmw_shadow_test.cpp` for the full behavior matrix (39 assertions across 10 scenarios covering sync / async / cache / write-buffer / validation branches).
 
+## Result redaction (v0.4.0 M7: mask result sets per role / tenant)
+
+Compliance scenarios (phone, ID, bank card) require masking result-set fields per role / tenant before the data leaves dbmw. **dbmw ships no masking rules** — that would be making compliance decisions on behalf of the caller. The framework only provides the SPI hook and the I10 guard (redacted results must never enter the cache).
+
+**Where to mutate**: SPI `afterExecution` (M1 §3.3) receives `view.result` as a mutable `common::ResultSet*`. After your interceptor finishes its redaction, set `view.result->transformed = true` — this is the only signal the framework uses to detect "this row has been redacted".
+
+**Example** (business implements their own `ISqlInterceptor`):
+
+```cpp
+class MaskingInterceptor : public dbmw::core::ISqlInterceptor {
+public:
+    void onRoute(const std::string&, const std::string&,
+                 dbmw::common::OperationType, dbmw::common::SqlContext&) override {}
+
+    dbmw::common::Status beforeExecution(const dbmw::core::ExecutionView&) override {
+        return dbmw::common::Status::OK();
+    }
+
+    void afterExecution(const dbmw::core::ExecutionView &view) override {
+        if (!view.result) return;                  // not a query (write / batch / cursor) — skip
+        // Your masking logic: detect sensitive fields by column name / index / value pattern
+        for (auto &row : view.result->rows()) {
+            // ... iterate row.data() and replace values per compliance rules ...
+        }
+        // Critical: signal that the row has been rewritten. The framework will
+        // hard-block this result from entering the query cache.
+        view.result->transformed = true;
+    }
+
+    void onCompletion(const dbmw::core::ExecutionView&) override {}
+};
+
+// Register before DBMW::init:
+dbmw::DBMW::addInterceptor(std::make_shared<MaskingInterceptor>());
+dbmw::core::InterceptorRegistry::setEnabled(true);
+```
+
+**The I10 guard's hard constraint**: after `transformed = true`, dbmw blocks the result from the cache in three places:
+
+| Location | Guard |
+|---|---|
+| `DataSource::queryUngated` (sync) | `if (caching && !out.transformed) QueryCache::put(...)` |
+| `DataSource::cacheStore` (sync) | `if (rows.transformed) return;` |
+| `async::query`'s `step2Statement` (async) | `if (policy.cacheable && !ctx->entryCtx.shadow) target->cacheStore(...)` — the inner `cacheStore` runs the guard |
+
+**Why redacted results must not enter the cache**: the cache stores raw results, but redaction is per-role / per-tenant view. Putting a redacted result into the cache means the next user with different permissions will read the previous user's view — **cross-user data leak**.
+
+**The cache-hit path still has to run `afterExecution`** (§9.4 risk row): the cache stores raw data (the guard ensures no `transformed=true` entry ever lands there), so a cache hit must still re-run `afterExecution` to produce the *current* user's view. Sync paths are wrapped by `runWithInterceptors`; async submit constructs a view manually and calls `detail::runAfterExecution(view)` once.
+
+**Constraint on mutating `ResultSet`**: `rows()` and `row.data()` currently return `const &`, so cells can't be rewritten in place. To mask, either:
+
+- cache the raw `Row.data()` index in your interceptor and read by column name, writing to your own `map<string, Value>`;
+- or wait for dbmw to expose a `ResultSet::transformRow(name, fn)` mutable entry point (M7 only ships the flag + the guard, no API surface expansion).
+
+Preserved invariant: **data in interceptor → data out interceptor → cache guard** all hinges solely on the `transformed` flag. See `tests/dbmw_redaction_test.cpp` for the full behavior matrix (38 assertions across 5 scenarios covering sync / async / cache hit / I10 guard / redaction flag).
+
 ## Async API (v0.2.0: callbacks / futures / coroutines)
 
 The three calling styles share one execution pipeline — governance gates (audit / rate limit / circuit breaker / cache), retry backoff, statement timeout, cancellation — and differ only in how results are delivered. Enable `async` in the config:

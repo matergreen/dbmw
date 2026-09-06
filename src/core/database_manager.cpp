@@ -1134,6 +1134,10 @@ namespace dbmw::core {
     void DataSource::cacheStore(const std::string &key, const common::ResultSet &rows) const {
         // M6（§8.3）：与 cacheLookup 同源。
         if (common::ContextScope::current().shadow) return;
+        // M7（§9.2 + I10）：脱敏结果绝不进缓存。transformed 是 SPI afterExecution
+        // 改写 view.result 后置位的标记。缓存存原始数据，脱敏是角色/租户视图——
+        // 把脱敏结果入库会让不同权限用户读到彼此的视图（跨用户泄漏）。
+        if (rows.transformed) return;
         if (!primary_ && QueryCache::enabled()) QueryCache::put(name_, key, rows);
     }
 
@@ -1192,7 +1196,10 @@ namespace dbmw::core {
             }
             afterAttempt(status);
             if (status.ok()) {
-                if (caching) QueryCache::put(name_, key, out);
+                // M7（§9.2 + I10）：与 DataSource::cacheStore 的守卫同源——
+                // SPI afterExecution 改写后置位 transformed，硬拦截入缓存。
+                // 性能上早于 QueryCache::put，避免一次 hash 计算 + 拷贝。
+                if (caching && !out.transformed) QueryCache::put(name_, key, out);
                 return status;
             }
             if (!status.retryable || attempt == attempts) return status;
@@ -1251,7 +1258,10 @@ namespace dbmw::core {
             }
             afterAttempt(status);
             if (status.ok()) {
-                if (caching) QueryCache::put(name_, key, out);
+                // M7（§9.2 + I10）：与 DataSource::cacheStore 的守卫同源——
+                // SPI afterExecution 改写后置位 transformed，硬拦截入缓存。
+                // 性能上早于 QueryCache::put，避免一次 hash 计算 + 拷贝。
+                if (caching && !out.transformed) QueryCache::put(name_, key, out);
                 return status;
             }
             if (!status.retryable || attempt == attempts) return status;
