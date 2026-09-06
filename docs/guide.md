@@ -631,6 +631,43 @@ dbmw 不执行选主、租约或 fencing，因此自动写切换默认拒绝启�
 - **生成键路径不进预编译缓存**：`executePrepared` 拿不到 `RETURNING` 的结果集，为省一次 prepare 让调用方静默拿不到主键是本末倒置。
 - **写缓冲 / 连接池的 TTL** 是对象生命周期过期，非 KV 缓存。
 
+## 动态数据源（v0.4.0 M4：运行时增删）
+
+`DBMW::init` 启动后，你仍然可以在运行时增删数据源与组——配置不再是一次性快照：
+
+| 方法 | 用途 |
+| --- | --- |
+| `DBMW::addDataSource(cfg, opts)` | 注册一个新的叶子数据源（建池 + 启动心跳 + 插入 DataSource） |
+| `DBMW::removeDataSource(name, grace=5s)` | 注销一个叶子数据源；被组引用时拒绝 |
+| `DBMW::addGroup(cfg, opts)` | 注册一个读写组（主 + 副本 + 故障转移 + 可选写缓冲） |
+| `DBMW::removeGroup(name, grace=5s)` | 注销一个组；停止其写缓冲线程 |
+
+`opts` 走 `core::DataSourceOptions` / `core::GroupOptions`，分别控制 `retry` / `circuit_breaker` / `rate_limiter` / `cursor` / `attach_heartbeat` 与 `acknowledge_external_fencing` / `acknowledge_data_loss_and_duplicates`。后者两个 ack 标志与 `init()` 一致——`addGroup` 不允许隐式启用自动写切换或写缓冲，调用方必须显式表态。
+
+**安全保证**：
+
+- **重名拒绝**：addDataSource / addGroup 对已存在的名字返回 `ConfigError`，**不会覆盖**原池（沿用原 init 的非破坏语义）。
+- **引用完整性**：removeDataSource 拒绝注销"被组引用"的叶子，错误消息明确指出冲突的组名；必须先 removeGroup 再 removeDataSource。
+- **网络 IO 全部在锁外**：校验、插入、销毁在 `mtx_` 临界区里完成；建池与 `WriteBuffer::start()` 在锁外发起，绝不持锁做 IO。
+- **addDataSource 不替换而是新建**：失败的并发插入把刚建的池以 grace=0 关掉，避免泄漏；旧池不受影响。
+- **grace 宽限期**：removeDataSource / removeGroup 的 grace 语义与 shutdown 一致——等待在途连接归还，超期强制关闭。grace=0 立即返回（池被标记 closed），适合"想下线但不想等"。
+
+```cpp
+dbmw::DBMW::init("datasources.json");                  // 启动期基线
+
+dbmw::core::DataSourceOptions leafOpts;
+dbmw::DBMW::addDataSource(cfg, leafOpts);              // 运行时加一个池
+
+dbmw::core::GroupOptions grpOpts;
+grpOpts.acknowledge_external_fencing = true;          // 必填：自动写切换需明确同意
+dbmw::DBMW::addGroup(grp, grpOpts);                    // 运行时组一个读写组
+
+dbmw::DBMW::removeGroup("legacy_grp");                 // 先卸组
+dbmw::DBMW::removeDataSource("legacy_leaf");           // 再卸叶子
+```
+
+并发安全由 `mtx_` 保证——多线程同时 addDataSource 不同名互不干扰；同名并发里后到者以 `ConfigError` 优雅失败，**不会**让两个调用者都以为自己成功。详细并发行为见 `tests/dbmw_dynamic_test.cpp`（79 项断言，16 个场景覆盖 add/remove/group/ack/并发/grace）。
+
 ## 异步 API（v0.2.0：回调 / future / 协程）
 
 三种调用形态共享同一条执行管线——治理闸门（审计/限流/熔断/缓存）、重试退避、语句超时、取消——只是结果交付方式不同。在配置中开启 `async`：

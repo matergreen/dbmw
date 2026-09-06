@@ -28,6 +28,12 @@ target_link_libraries(dbmw_observability_test PRIVATE dbmw)
 add_executable(dbmw_exporters_test dbmw_exporters_test.cpp)
 target_link_libraries(dbmw_exporters_test PRIVATE dbmw)
 
+# M4 动态数据源单测：运行时 addDataSource / addGroup / removeDataSource /
+# removeGroup 的成功路径、重名拒绝、引用完整性、ack 校验、并发安全、grace
+# 宽限期。无真实数据库依赖。
+add_executable(dbmw_dynamic_test dbmw_dynamic_test.cpp)
+target_link_libraries(dbmw_dynamic_test PRIVATE dbmw)
+
 # 真实数据库集成测试默认不构建，避免普通单元测试依赖外部服务；
 # 开启时由各 DBMW_TEST_* 环境变量提供连接信息，测试只操作自己的临时对象。
 if(DBMW_BUILD_INTEGRATION_TESTS AND DBMW_ENABLE_POSTGRES)
@@ -87,3 +93,4 @@ add_test(NAME dbmw_context_test COMMAND dbmw_context_test)
 add_test(NAME dbmw_interceptor_test COMMAND dbmw_interceptor_test)
 add_test(NAME dbmw_observability_test COMMAND dbmw_observability_test)
 add_test(NAME dbmw_exporters_test COMMAND dbmw_exporters_test)
+add_test(NAME dbmw_dynamic_test COMMAND dbmw_dynamic_test)

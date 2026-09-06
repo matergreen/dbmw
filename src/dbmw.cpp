@@ -251,4 +251,29 @@ namespace dbmw {
     void DBMW::clearInterceptors() {
         core::InterceptorRegistry::clear();
     }
+
+    // -------------------------------------------------------------------
+    // v0.4.0 M4：动态增删透传
+    // -------------------------------------------------------------------
+    common::Status DBMW::addDataSource(
+        const config::DataSourceConfig &cfg,
+        const core::DataSourceOptions &opts) {
+        return mgr().addDataSource(cfg, opts);
+    }
+
+    common::Status DBMW::removeDataSource(const std::string &name,
+                                           const std::chrono::milliseconds grace) {
+        return mgr().removeDataSource(name, grace);
+    }
+
+    common::Status DBMW::addGroup(
+        const config::DataSourceGroupConfig &cfg,
+        const core::GroupOptions &opts) {
+        return mgr().addGroup(cfg, opts);
+    }
+
+    common::Status DBMW::removeGroup(const std::string &name,
+                                      const std::chrono::milliseconds grace) {
+        return mgr().removeGroup(name, grace);
+    }
 } // namespace dbmw

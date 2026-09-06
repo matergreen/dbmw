@@ -128,7 +128,7 @@
 | M1 | SPI 扩展点 | **地基**。没有它，后面每个能力都要动 `database_manager.cpp`（1300+ 行，承载 I1–I4 不变量）。有了它，后续能力降级为"挂插件" |
 | M2 | 追踪上下文 | 成本最低、价值最直接。中间件是所有 SQL 的必经之路，加一个上下文槽即可让日志/慢 SQL/指标全部可串联 |
 | M3 | 指标导出增强 | 依赖 M2（指标需要 trace 维度）；机制已有，只是补字段与出口 |
-| M4 | 动态数据源 | 独立于 SPI，但改动面集中在 `DatabaseManager::init` 的替换逻辑，宜早做以暴露生命周期问题 |
+| M4 | 动态数据源 | ✅ **已落地**（2026-09）——`addDataSource/removeDataSource/addGroup/removeGroup` + facade 透传 + 79 项单测。独立于 SPI，改动面集中在 `DatabaseManager::init` 的替换逻辑，宜早做以暴露生命周期问题 |
 | M5 | 幂等声明 | 独立小改动，把重试语义从"引擎猜"变成"调用方声明" |
 | M6 | 影子库路由 | 依赖 M1（路由决策）+ 复用现有组路由框架 |
 | M7 | 结果脱敏 | 依赖 M1（结果改写）。之所以排后：它触碰结果集与缓存（I10），需要前序能力稳定后再动 |
@@ -557,6 +557,22 @@ public:
 | 组引用已注销数据源 | `validateGroupRefs` 双向校验 |
 | 与 `init()` 并发调用 | 文档要求二者不可并发；实现上加断言或返回 `Busy` |
 | 写缓冲持有叶子强引用 | 注销叶子前必须先停该组的 `writeBuffers_`（I8） |
+
+### §6.5 实施状态（v0.4.0）
+
+✅ **已落地**（2026-09）：
+
+- `DatabaseManager::addDataSource(cfg, opts)` / `removeDataSource(name, grace)` / `addGroup(cfg, opts)` / `removeGroup(name, grace)` 全部实现；
+- `DBMW` facade 透传同名 4 个静态方法；
+- 引用完整性 / 重名拒绝 / ack 校验 / 并发安全均按 §6.3 落地；
+- `addDataSource` 默认 pool 参数（min=1, max=32, 30s 借出超时），覆盖常见场景；如需定制在 `init()` 阶段按 `GlobalConfig::pool` 配齐，运行时路径走默认；
+- `tests/dbmw_dynamic_test.cpp` 16 个场景 / 79 项断言全过。
+
+**遗留与偏差**：
+
+- §6.3 提到的 "与 `init()` 并发调用" 现通过 `mtx_` 串行化（不加 `Busy` 返回值，亦不抛异常）——调用方遵守文档约束即可。已在 `addDataSource` 注释里写明"reload 进行中触发增删可能让 reload 的 oldWriteBuffers 集合错过刚加进来的缓冲"。
+- `GroupOptions` 仅暴露 `ack` 标志与限流器；`retry` / `circuit_breaker` / `cursor` 等仍按 `init()` 阶段全局下发；后续若需要"每组独立"语义，把字段从 `GlobalConfig` 挪到 `GroupOptions` 即可（API 设计留口）。
+- `removeDataSource` 未支持的 `grace=0` 路径会"立即返回 + 池被标记 closed"，但池里在途连接的析构由借出者 RAII 兜底——已通过 M4.16 验证。
 
 ---
 

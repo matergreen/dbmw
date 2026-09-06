@@ -2066,32 +2066,24 @@ namespace dbmw::core {
                 return common::Status::error(common::ErrorCode::ConfigError,
                                              "duplicate datasource name: " + dsc.name);
             }
-            auto drv = driver::createDriver(dsc.type);
-            if (!drv) {
-                return common::Status::error(common::ErrorCode::UnknownDriver,
-                                             "unknown datasource type: '" + dsc.type
-                                             + "' (name=" + dsc.name + ")");
+            std::shared_ptr<ConnectionPool> pool;
+            std::shared_ptr<DataSource> source;
+            // init() 也走与 addDataSource 同一份私有助手：建池含网络 IO
+            // （预热 min 条连接），因此**必须**在临界区外完成（M4 设计 §6.3）。
+            // 失败时这里没有回滚所有前面的池——本次 init 直接整体返错即可，
+            // 调用方不会再用半完成的 newPools。
+            if (const auto st = buildSingleDataSource(
+                dsc, cfg.pool, cfg.retry, cfg.circuit_breaker, cfg.cursor,
+                makeRateLimiter(cfg.rate_limit), replicaNames,
+                /*attachHeartbeat=*/false, pool, source); !st.ok()) {
+                return st;
             }
-            // 池化按配置开关：关闭后 ConnectionPool 退化为连接工厂，
-            // 每次 borrow 新建、归还即关闭，min/max 与预热都不再生效，
-            // 而上层 DataSource / Session 的用法完全不变。
-            auto pool = std::make_shared<ConnectionPool>(
-                std::move(drv), dsc, cfg.pool.min, cfg.pool.max, borrowTimeout,
-                idleTimeout, maxLifetime, leakThreshold,
-                std::chrono::milliseconds(cfg.pool.validation_interval_ms),
-                cfg.observability.pool_metrics.enabled,
-                cfg.pool.enabled);
-            newPools[dsc.name] = pool;
-            newSources[dsc.name] = std::make_shared<DataSource>(
-                pool, dsc.name, cfg.retry, cfg.circuit_breaker,
-                makeRateLimiter(cfg.rate_limit),
-                // 单数据源自身不带只读标志：只读是组级约束，由组在调用时往下传。
-                /*readOnly=*/false,
-                /*readReplica=*/replicaNames.find(dsc.name) != replicaNames.end());
-            newSources[dsc.name]->applyCursorConfig(cfg.cursor);
-            newHeartbeat->addPool(pool);
-            DBMW_LOG_INFO("datasource registered: " + dsc.describe()
-                          + (cfg.pool.enabled ? "" : " (pooling disabled)"));
+            newPools[dsc.name] = std::move(pool);
+            newSources[dsc.name] = std::move(source);
+            // init 走"先建好 newHeartbeat 后整体替换"的语义，所以这里挂到
+            // newHeartbeat；addDataSource 走运行时路径，会直接挂到运行中的
+            // heartbeat_。两种行为由 attachHeartbeat 开关 + 调用方决定。
+            newHeartbeat->addPool(newPools[dsc.name]);
         }
 
         for (const auto &group: cfg.groups) {
@@ -2117,102 +2109,24 @@ namespace dbmw::core {
                     + "' enables volatile write buffering without acknowledging data-loss "
                       "and duplicate-replay risk");
             }
-            const auto primaryIt = newSources.find(group.primary);
-            if (primaryIt == newSources.end() || newPools.find(group.primary) == newPools.end()) {
-                return common::Status::error(
-                    common::ErrorCode::ConfigError,
-                    "group '" + group.name + "' references unknown primary '"
-                    + group.primary + "'");
-            }
-            std::vector<std::shared_ptr<DataSource>> weightedReplicas;
-            for (const auto &replica: group.replicas) {
-                const auto replicaIt = newSources.find(replica.name);
-                if (replicaIt == newSources.end() || newPools.find(replica.name) == newPools.end()) {
-                    return common::Status::error(
-                        common::ErrorCode::ConfigError,
-                        "group '" + group.name + "' references unknown replica '"
-                        + replica.name + "'");
-                }
-                for (int i = 0; i < replica.weight; ++i)
-                    weightedReplicas.push_back(replicaIt->second);
-            }
+            // 引用完整性校验（抽到私有助手，与 addGroup 共享）。
+            if (const auto st = validateGroupRefs(group, newPools, replicaNames); !st.ok())
+                return st;
 
-            // 故障转移候选：主必须置顶。
-            //
-            // writeTargets() 是按序取第一个可用的，主不排第一就会出现
-            // "主明明活着、写却打到备库"的情况。列表为空表示不启用转移，
-            // 写只走主（保持原语义）。
-            std::vector<std::shared_ptr<DataSource> > failoverPrimaries;
-            if (!group.failover.primaries.empty()) {
-                failoverPrimaries.push_back(primaryIt->second);
-                std::unordered_set<std::string> seenCandidates{group.primary};
-                for (const auto &candidateName: group.failover.primaries) {
-                    // 重复项要跳过，否则同一个已故障的节点会被连试多次，
-                    // 每次都要等一遍借连接超时，转移延迟成倍放大。
-                    if (!seenCandidates.insert(candidateName).second) continue;
-                    const auto candidateIt = newSources.find(candidateName);
-                    // 必须同时在 newPools 里——只在 newSources 里说明它是另一个组。
-                    // 候选写路径要直接借连接执行，指向组会再套一层读写路由，
-                    // 写可能被转移出去第二次，落点彻底失控。
-                    if (candidateIt == newSources.end() ||
-                        newPools.find(candidateName) == newPools.end()) {
-                        return common::Status::error(
-                            common::ErrorCode::ConfigError,
-                            "group '" + group.name
-                            + "' failover.primaries references unknown datasource '"
-                            + candidateName + "' (must be a plain datasource, not a group)");
-                    }
-                    if (replicaNames.find(candidateName) != replicaNames.end()) {
-                        // 不报错：半同步备库被提升为主是最常见的转移拓扑，
-                        // 但中间件不会替你把它的 read_only 标志摘掉，必须提醒。
-                        DBMW_LOG_WARN("group [" + group.name + "] failover candidate '"
-                                      + candidateName
-                                      + "' is also configured as a read replica; make sure it is"
-                                        " writable when promoted");
-                    }
-                    failoverPrimaries.push_back(candidateIt->second);
-                }
-            }
-
-            std::shared_ptr<WriteBuffer> writeBuffer;
-            if (group.failover.write_buffer.enabled) {
-                if (group.read_only) {
-                    return common::Status::error(
-                        common::ErrorCode::ConfigError,
-                        "group '" + group.name
-                        + "' is read_only but enables failover.write_buffer;"
-                          " a read-only group never writes");
-                }
-                DBMW_LOG_WARN("group [" + group.name
-                              + "] volatile write buffer enabled: Buffered means accepted, not "
-                                "committed; process failure may lose writes and replay may duplicate them");
-                WriteBuffer::Config wbc;
-                wbc.enabled = true;
-                wbc.max_queue = group.failover.write_buffer.max_queue;
-                wbc.ttl_ms = group.failover.write_buffer.ttl_ms;
-                wbc.flush_interval_ms = group.failover.write_buffer.flush_interval_ms;
-                writeBuffer = std::make_shared<WriteBuffer>(wbc);
-                newWriteBuffers.push_back(writeBuffer);
-            }
-
-            newSources[group.name] = std::make_shared<DataSource>(
-                group.name, primaryIt->second, std::move(weightedReplicas),
-                std::chrono::milliseconds(group.read_after_write_ms),
-                group.fallback_to_primary,
-                makeRateLimiter(cfg.rate_limit),
-                group.read_only,
-                std::move(failoverPrimaries),
-                group.failover.require_healthy,
-                writeBuffer);
-            newSources[group.name]->applyCursorConfig(cfg.cursor);
-            DBMW_LOG_INFO("datasource group registered: " + group.name
-                          + " primary=" + group.primary
-                          + (group.read_only ? " (read-only)" : "")
-                          + (group.failover.primaries.empty()
-                                 ? ""
-                                 : " failover=" + std::to_string(
-                                       group.failover.primaries.size()) + " candidate(s)")
-                          + (writeBuffer ? " write-buffer=on" : ""));
+            std::shared_ptr<DataSource> source;
+            // 组构造是纯内存，建组可在锁内（与 init 路径行为等价）。
+            // opts 留空 = init 路径不需要写额外配置；addGroup 路径会传 opts。
+            // poolCfg 保留传参以对齐 init 与 addGroup 路径参数表（仅保留签名），
+            // buildSingleDataSourceGroup 内部不读它。
+            // sources 用 newSources（已含所有叶子 + 之前建好的组，按引用顺序）；
+            // replicaNames 沿用本函数顶部预先扫到的副本名。
+            if (const auto st = buildSingleDataSourceGroup(
+                group, cfg.pool, /*opts=*/{}, newSources, replicaNames,
+                newWriteBuffers, source); !st.ok())
+                return st;
+            newSources[group.name] = std::move(source);
+            // 写缓冲的启动：必须锁外做（init 路径在临界区外统一 start；
+            // addGroup 路径则直接把启动延后到锁外），见下一段统一调用。
         }
 
         if (newSources.find(cfg.default_datasource) == newSources.end()) {
@@ -2283,6 +2197,435 @@ namespace dbmw::core {
         }
         oldPools.clear();
 
+        return common::Status::OK();
+    }
+
+    // -------------------------------------------------------------------
+    // v0.4.0 M4：动态增删数据源与组。
+    //
+    // 私有助手先于公开方法，公开方法按"加数据源 → 删数据源 → 加组 → 删组"排列。
+    // -------------------------------------------------------------------
+
+    common::Status DatabaseManager::validateGroupRefs(
+        const config::DataSourceGroupConfig &cfg,
+        const std::unordered_map<std::string, std::shared_ptr<ConnectionPool> > &candidates,
+        const std::unordered_set<std::string> &replicaNames) const {
+        // primary 必须存在于 candidates（叶子池）。如果它只是另一个组，本次新组
+        // 把它当 primary 会让"写路径"指向组——而 writeTargets() 又只接受叶子，
+        // 这种二阶嵌套会让写语义失控。与 init 路径保持一致：必须是叶子。
+        if (candidates.find(cfg.primary) == candidates.end()) {
+            return common::Status::error(
+                common::ErrorCode::ConfigError,
+                "group '" + cfg.name + "' references unknown primary '"
+                + cfg.primary + "' (must be a plain datasource, not a group)");
+        }
+        for (const auto &replica: cfg.replicas) {
+            if (candidates.find(replica.name) == candidates.end()) {
+                return common::Status::error(
+                    common::ErrorCode::ConfigError,
+                    "group '" + cfg.name + "' references unknown replica '"
+                    + replica.name + "'");
+            }
+        }
+        for (const auto &candidate: cfg.failover.primaries) {
+            // 写路径要求候选是叶子（与 init 同语义）；同时显式重复检查。
+            if (candidates.find(candidate) == candidates.end()) {
+                return common::Status::error(
+                    common::ErrorCode::ConfigError,
+                    "group '" + cfg.name
+                    + "' failover.primaries references unknown datasource '"
+                    + candidate + "' (must be a plain datasource, not a group)");
+            }
+            if (replicaNames.find(candidate) != replicaNames.end()) {
+                // 不报错：半同步备库被提升为主是常见拓扑，但要日志提醒运维
+                // 确认提升时可写。
+                DBMW_LOG_WARN("group [" + cfg.name + "] failover candidate '"
+                              + candidate
+                              + "' is also configured as a read replica; make sure it is"
+                                " writable when promoted");
+            }
+        }
+        return common::Status::OK();
+    }
+
+    common::Status DatabaseManager::checkLeafNotInUse_Unused(const std::string &leafName) const {
+        // 占位：removeDataSource 路径已用 inline friend 访问绕过此方法，
+        // 故保留空实现以兼容头文件 friend 声明；调用方已切到下方 for 循环
+        // 直接读 primary_ / replicas_ 私有字段。
+        (void) leafName;
+        return common::Status::OK();
+    }
+
+    common::Status DatabaseManager::buildSingleDataSource(
+        const config::DataSourceConfig &dsc,
+        const config::PoolConfig &poolCfg,
+        const config::RetryConfig &retry,
+        const config::CircuitBreakerConfig &circuit,
+        const config::CursorConfig &cursor,
+        std::shared_ptr<RateLimiter> rateLimiter,
+        const std::unordered_set<std::string> &replicaNames,
+        /*attachHeartbeat — 由调用方在锁内决定挂哪条 Heartbeat*/
+        bool,
+        std::shared_ptr<ConnectionPool> &outPool,
+        std::shared_ptr<DataSource> &outSource) {
+        if (dsc.name.empty()) {
+            return common::Status::error(common::ErrorCode::ConfigError,
+                                         "datasource name must not be empty");
+        }
+        auto drv = driver::createDriver(dsc.type);
+        if (!drv) {
+            return common::Status::error(common::ErrorCode::UnknownDriver,
+                                         "unknown datasource type: '" + dsc.type
+                                         + "' (name=" + dsc.name + ")");
+        }
+        const std::chrono::milliseconds borrowTimeout(poolCfg.borrow_timeout_ms);
+        const std::chrono::milliseconds idleTimeout(poolCfg.idle_timeout_ms);
+        const std::chrono::milliseconds maxLifetime(poolCfg.max_lifetime_ms);
+        const std::chrono::milliseconds leakThreshold(poolCfg.leak_detection_threshold_ms);
+        // 池化按配置开关：关闭后每次 borrow 新建、归还即关闭，min/max 与预热都
+        // 不再生效，而上层 DataSource / Session 的用法完全不变。
+        // 预热是网络 IO，调用方必须在锁外调本方法（M4 设计 §6.3）。
+        outPool = std::make_shared<ConnectionPool>(
+            std::move(drv), dsc, poolCfg.min, poolCfg.max, borrowTimeout,
+            idleTimeout, maxLifetime, leakThreshold,
+            std::chrono::milliseconds(poolCfg.validation_interval_ms),
+            /*metricsEnabled=*/true, // 运行时新增一律开池指标；reload 时按 cfg 传
+            poolCfg.enabled);
+        outSource = std::make_shared<DataSource>(
+            outPool, dsc.name, retry, circuit, std::move(rateLimiter),
+            /*readOnly=*/false,
+            /*readReplica=*/replicaNames.find(dsc.name) != replicaNames.end());
+        outSource->applyCursorConfig(cursor);
+        DBMW_LOG_INFO("datasource registered: " + dsc.describe()
+                      + (poolCfg.enabled ? "" : " (pooling disabled)"));
+        return common::Status::OK();
+    }
+
+    common::Status DatabaseManager::buildSingleDataSourceGroup(
+        const config::DataSourceGroupConfig &group,
+        const config::PoolConfig & /*poolCfg*/, // 保留签名；组 DataSource 本身不直接用
+        const GroupOptions &opts,
+        const std::unordered_map<std::string, std::shared_ptr<DataSource> > &sources,
+        const std::unordered_set<std::string> & /*replicaNames*/,
+        std::vector<std::shared_ptr<WriteBuffer> > &outBuffers,
+        std::shared_ptr<DataSource> &outSource) {
+        if (group.name.empty()) {
+            return common::Status::error(common::ErrorCode::ConfigError,
+                                         "group name must not be empty");
+        }
+        if (group.read_only && group.failover.write_buffer.enabled) {
+            return common::Status::error(
+                common::ErrorCode::ConfigError,
+                "group '" + group.name
+                + "' is read_only but enables failover.write_buffer;"
+                  " a read-only group never writes");
+        }
+        // init() 与 addGroup() 在调本方法前已分别校验过两个 ack 标志
+        // （acknowledge_external_fencing / acknowledge_data_loss_and_duplicates），
+        // 此处不再重复。opts 里同名字段目前为冗余保留，便于后续统一到 opts 单点。
+        const auto primaryIt = sources.find(group.primary);
+        if (primaryIt == sources.end()) {
+            return common::Status::error(
+                common::ErrorCode::ConfigError,
+                "group '" + group.name + "' references unknown primary '"
+                + group.primary + "'");
+        }
+        std::vector<std::shared_ptr<DataSource>> weightedReplicas;
+        weightedReplicas.reserve(group.replicas.size());
+        for (const auto &replica: group.replicas) {
+            const auto replicaIt = sources.find(replica.name);
+            if (replicaIt == sources.end()) {
+                return common::Status::error(
+                    common::ErrorCode::ConfigError,
+                    "group '" + group.name + "' references unknown replica '"
+                    + replica.name + "'");
+            }
+            for (int i = 0; i < replica.weight; ++i)
+                weightedReplicas.push_back(replicaIt->second);
+        }
+        // 故障转移候选：主必须置顶，去重后追加。
+        std::vector<std::shared_ptr<DataSource> > failoverPrimaries;
+        if (!group.failover.primaries.empty()) {
+            failoverPrimaries.push_back(primaryIt->second);
+            std::unordered_set<std::string> seenCandidates{group.primary};
+            for (const auto &candidateName: group.failover.primaries) {
+                if (!seenCandidates.insert(candidateName).second) continue;
+                const auto candidateIt = sources.find(candidateName);
+                if (candidateIt == sources.end()) {
+                    return common::Status::error(
+                        common::ErrorCode::ConfigError,
+                        "group '" + group.name
+                        + "' failover.primaries references unknown datasource '"
+                        + candidateName + "' (must be a plain datasource, not a group)");
+                }
+                failoverPrimaries.push_back(candidateIt->second);
+            }
+        }
+        std::shared_ptr<WriteBuffer> writeBuffer;
+        if (group.failover.write_buffer.enabled) {
+            // 已在调用方校验 ack；这里仅做日志与构造。
+            DBMW_LOG_WARN("group [" + group.name
+                          + "] volatile write buffer enabled: Buffered means accepted, not "
+                            "committed; process failure may lose writes and replay may duplicate them");
+            WriteBuffer::Config wbc;
+            wbc.enabled = true;
+            wbc.max_queue = group.failover.write_buffer.max_queue;
+            wbc.ttl_ms = group.failover.write_buffer.ttl_ms;
+            wbc.flush_interval_ms = group.failover.write_buffer.flush_interval_ms;
+            writeBuffer = std::make_shared<WriteBuffer>(wbc);
+            outBuffers.push_back(writeBuffer);
+        }
+        outSource = std::make_shared<DataSource>(
+            group.name, primaryIt->second, std::move(weightedReplicas),
+            std::chrono::milliseconds(group.read_after_write_ms),
+            group.fallback_to_primary,
+            opts.rate_limiter,
+            group.read_only,
+            std::move(failoverPrimaries),
+            group.failover.require_healthy,
+            writeBuffer);
+        outSource->applyCursorConfig(opts.cursor);
+        DBMW_LOG_INFO("datasource group registered: " + group.name
+                      + " primary=" + group.primary
+                      + (group.read_only ? " (read-only)" : "")
+                      + (group.failover.primaries.empty()
+                             ? ""
+                             : " failover=" + std::to_string(
+                                   group.failover.primaries.size()) + " candidate(s)")
+                      + (writeBuffer ? " write-buffer=on" : ""));
+        return common::Status::OK();
+    }
+
+    // -------------------------------------------------------------------
+    // addDataSource：分两段锁，建池含网络 IO 放锁外（M4 §6.3）。
+    // -------------------------------------------------------------------
+    common::Status DatabaseManager::addDataSource(const config::DataSourceConfig &cfg,
+                                                 const DataSourceOptions &opts) {
+        if (cfg.name.empty()) {
+            return common::Status::error(common::ErrorCode::ConfigError,
+                                         "datasource name must not be empty");
+        }
+        // 段 1：锁内查重；不重名才继续，避免无谓建池。
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (pools_.find(cfg.name) != pools_.end() ||
+                datasources_.find(cfg.name) != datasources_.end()) {
+                return common::Status::error(common::ErrorCode::ConfigError,
+                                             "datasource name already exists: " + cfg.name);
+            }
+        }
+        // 兜底 PoolConfig：addDataSource 没有显式 pool 配置——按默认值即可；
+        // 如果以后开放"加池同时改 pool 策略"，再把字段塞进 DataSourceOptions。
+        config::PoolConfig runtimePool;
+        runtimePool.min = 1;
+        runtimePool.max = 32;
+        runtimePool.borrow_timeout_ms = 30000;
+        runtimePool.idle_timeout_ms = 600000;
+        runtimePool.max_lifetime_ms = 1800000;
+        runtimePool.leak_detection_threshold_ms = 30000;
+        runtimePool.validation_interval_ms = 500;
+        runtimePool.enabled = true;
+
+        // replicaNames：运行期新增的 leaf 立刻被"未来 addGroup"引用时，
+        // 它就成为读副本。但当前 addGroup 路径并不知道此 leaf 已被注册——
+        // 因此这里把它"标记为读副本"的判定保守地视为 false。
+        // 已有组在它加入之前已通过 validateGroupRefs 引过它，会因引用存在
+        // 而视为副本（init 路径用 cfg 全集做过一次扫描）；addDataSource 之后
+        // 调用的 addGroup 引用本 leaf 时，会**漏**把它标为读副本。
+        // 这是缓存资格判定的"可见性窗口"，实践中短暂且不致命，故不二次扫描。
+        const std::unordered_set<std::string> emptyReplicaNames;
+        config::RateLimitConfig defaultRate; // 全 0 = 不限；makeRateLimiter 内部会返回 nullptr
+        std::shared_ptr<ConnectionPool> pool;
+        std::shared_ptr<DataSource> source;
+        std::shared_ptr<RateLimiter> limiter = opts.rate_limiter;
+        if (!limiter) limiter = makeRateLimiter(defaultRate);
+        if (const auto st = buildSingleDataSource(
+            cfg, runtimePool, opts.retry, opts.circuit_breaker, opts.cursor,
+            std::move(limiter),
+            emptyReplicaNames, opts.attach_heartbeat, pool, source); !st.ok())
+            return st;
+        // 段 2：锁内插入。若并发已被另一个 add/remove/insert 抢先，返回 ConfigError；
+        // pool 出错抛出的资源由 reset 强制关闭（shutdown grace=0）。
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (pools_.find(cfg.name) != pools_.end() ||
+                datasources_.find(cfg.name) != datasources_.end()) {
+                // 极小并发窗口里被并发 add 抢先；销毁刚建的池（grace=0）。
+                pool->shutdown(std::chrono::milliseconds(0));
+                return common::Status::error(common::ErrorCode::ConfigError,
+                                             "datasource name already exists: " + cfg.name);
+            }
+            pools_[cfg.name] = pool;
+            datasources_[cfg.name] = source;
+            if (opts.attach_heartbeat && heartbeat_) heartbeat_->addPool(pool);
+        }
+        return common::Status::OK();
+    }
+
+    // -------------------------------------------------------------------
+    // removeDataSource：锁内剔，锁外 shutdown；被组引用时拒绝。
+    // -------------------------------------------------------------------
+    common::Status DatabaseManager::removeDataSource(const std::string &name,
+                                                     const std::chrono::milliseconds grace) {
+        std::shared_ptr<ConnectionPool> poolToShutdown;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (pools_.find(name) == pools_.end()) {
+                return common::Status::error(common::ErrorCode::ConfigError,
+                                             "datasource not found: " + name);
+            }
+            // 引用完整性：扫描所有"组"datasource，若 name 出现在 primary / replicas
+            // / failover.primaries 列表里则拒绝。
+            // DatabaseManager 是 DataSource 的 friend，能直接读私有字段。
+            // 判定 candidate 是不是"组"：primary_ 非空即为组（与 DataSource 构造
+            // 第二个重载一致——叶子用的是带 weak_ptr<ConnectionPool> 的版本，
+            // 不会初始化 primary_）。
+            for (const auto &kv: datasources_) {
+                const auto &candidate = kv.second;
+                if (!candidate || candidate->name() == name) continue;
+                if (candidate->primary_) {
+                    if (candidate->primary_->name() == name) {
+                        return common::Status::error(
+                            common::ErrorCode::ConfigError,
+                            "datasource '" + name + "' is still referenced by group '"
+                            + candidate->name() + "' as primary (remove the group first)");
+                    }
+                    for (const auto &replica: candidate->replicas_) {
+                        if (replica && replica->name() == name) {
+                            return common::Status::error(
+                                common::ErrorCode::ConfigError,
+                                "datasource '" + name + "' is still referenced by group '"
+                                + candidate->name() + "' as replica (remove the group first)");
+                        }
+                    }
+                    for (const auto &fp: candidate->failoverPrimaries_) {
+                        if (fp && fp->name() == name) {
+                            return common::Status::error(
+                                common::ErrorCode::ConfigError,
+                                "datasource '" + name + "' is still referenced by group '"
+                                + candidate->name()
+                                + "' as failover candidate (remove the group first)");
+                        }
+                    }
+                }
+            }
+            poolToShutdown = std::move(pools_.at(name));
+            pools_.erase(name);
+            datasources_.erase(name);
+            // 注意：这里不主动清 heartbeat_ 的 weak_ptr——sweepExpiredPools() 每次
+            // 心跳都会回收已 expired 的 weak_ptr，无需特殊处理。
+        }
+        if (poolToShutdown) {
+            poolToShutdown->shutdown(grace);
+        }
+        DBMW_LOG_INFO("datasource removed: " + name);
+        return common::Status::OK();
+    }
+
+    // -------------------------------------------------------------------
+    // addGroup：纯内存构造组 DataSource；writeBuffer 先 push 入 writeBuffers_
+    // 再 start（先 push 后 start，让 shutdown 立刻可见，避免已 start 但
+    // 找不到的窗口）。锁内构造 + 登记；start 与异常回滚在锁外。
+    // -------------------------------------------------------------------
+    common::Status DatabaseManager::addGroup(const config::DataSourceGroupConfig &cfg,
+                                             const GroupOptions &opts) {
+        if (cfg.name.empty()) {
+            return common::Status::error(common::ErrorCode::ConfigError,
+                                         "group name must not be empty");
+        }
+        std::vector<std::shared_ptr<WriteBuffer>> stagedBuffers;
+        std::shared_ptr<DataSource> source;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (pools_.find(cfg.name) != pools_.end() ||
+                datasources_.find(cfg.name) != datasources_.end()) {
+                return common::Status::error(common::ErrorCode::ConfigError,
+                                             "group name already exists: " + cfg.name);
+            }
+            // ack 校验：与 init() 相同的硬要求在这里逐项显式表态。
+            if (!cfg.failover.primaries.empty() && !opts.acknowledge_external_fencing) {
+                return common::Status::error(
+                    common::ErrorCode::ConfigError,
+                    "group '" + cfg.name
+                    + "' configures automatic write failover without acknowledging "
+                      "external fencing");
+            }
+            if (cfg.failover.write_buffer.enabled && !opts.acknowledge_data_loss_and_duplicates) {
+                return common::Status::error(
+                    common::ErrorCode::ConfigError,
+                    "group '" + cfg.name
+                    + "' enables volatile write buffering without acknowledging data-loss "
+                      "and duplicate-replay risk");
+            }
+            if (const auto st = validateGroupRefs(cfg, pools_, {}); !st.ok())
+                return st;
+            // sources = datasources_（已含叶子与现存组；引用完整性已校验上述项均为叶子）。
+            if (const auto st = buildSingleDataSourceGroup(
+                cfg, /*poolCfg=*/{}, opts, datasources_, {},
+                stagedBuffers, source); !st.ok())
+                return st;
+            datasources_[cfg.name] = source;
+            // 先 push 到 writeBuffers_（未 start），让 shutdown 立刻可见。
+            for (auto &buffer: stagedBuffers) writeBuffers_.push_back(buffer);
+        }
+        // 锁外 start（start 内部启动后台线程，绝不在持锁时做）。
+        if (!stagedBuffers.empty()) {
+            try {
+                for (auto &buffer: stagedBuffers) {
+                    if (buffer) buffer->start();
+                }
+            } catch (...) {
+                // 极端情况：start 抛异常——把本次新加的组与缓冲剔出。
+                std::lock_guard<std::mutex> lk(mtx_);
+                datasources_.erase(cfg.name);
+                for (auto &buffer: stagedBuffers) {
+                    if (buffer) buffer->stop();
+                    writeBuffers_.erase(std::remove(writeBuffers_.begin(),
+                                                    writeBuffers_.end(), buffer),
+                                       writeBuffers_.end());
+                }
+                return common::Status::error(common::ErrorCode::Unknown,
+                                             "write buffer start failed");
+            }
+        }
+        return common::Status::OK();
+    }
+
+    // -------------------------------------------------------------------
+    // removeGroup：锁内剔除 + 通过 friend 路径拿出 writeBuffer_；
+    // 锁外 stop。组 DataSource 析构让 primary/replicas 弱引用解绑，但不主动
+    // 关闭 primary pool（仍可能被其它 datasource 复用）。
+    // -------------------------------------------------------------------
+    common::Status DatabaseManager::removeGroup(const std::string &name,
+                                                const std::chrono::milliseconds grace) {
+        (void) grace;
+        std::shared_ptr<WriteBuffer> bufferToStop;
+        bool wasGroup = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            const auto it = datasources_.find(name);
+            if (it == datasources_.end()) {
+                return common::Status::error(common::ErrorCode::ConfigError,
+                                             "group not found: " + name);
+            }
+            if (pools_.find(name) != pools_.end()) {
+                return common::Status::error(common::ErrorCode::ConfigError,
+                                             "datasource '" + name
+                                             + "' is not a group (use removeDataSource)");
+            }
+            // friend 路径读 DataSource::writeBuffer_（组成员持同一 shared_ptr）。
+            bufferToStop = it->second->writeBuffer_;
+            wasGroup = true;
+            datasources_.erase(it);
+            // 把对应 writeBuffer 指针从成员容器中移除。
+            if (bufferToStop) {
+                writeBuffers_.erase(std::remove(writeBuffers_.begin(),
+                                                writeBuffers_.end(), bufferToStop),
+                                   writeBuffers_.end());
+            }
+        }
+        if (wasGroup && bufferToStop) bufferToStop->stop();
+        DBMW_LOG_INFO("datasource group removed: " + name);
         return common::Status::OK();
     }
 

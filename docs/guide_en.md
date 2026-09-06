@@ -583,6 +583,43 @@ In `observer.cpp`, slow-SQL aggregation: when a statement is judged slow it is a
 - **The generated-keys path bypasses the prepared cache**: `executePrepared` cannot capture the `RETURNING` result set; saving one prepare at the cost of silently hiding the primary key from the caller would be putting the cart before the horse.
 - **Write buffer / connection-pool TTL** are object-lifecycle expiries, not KV caches.
 
+## Dynamic data sources (v0.4.0 M4: add/remove at runtime)
+
+After `DBMW::init` starts, you can still add and remove data sources and groups at runtime — the config is no longer a one-shot snapshot:
+
+| Method | Purpose |
+| --- | --- |
+| `DBMW::addDataSource(cfg, opts)` | Register a new leaf data source (build pool + start heartbeat + insert DataSource) |
+| `DBMW::removeDataSource(name, grace=5s)` | Unregister a leaf data source; refused if referenced by a group |
+| `DBMW::addGroup(cfg, opts)` | Register a read-write group (primary + replicas + failover + optional write buffer) |
+| `DBMW::removeGroup(name, grace=5s)` | Unregister a group; stops its write-buffer thread |
+
+`opts` uses `core::DataSourceOptions` / `core::GroupOptions`, which control `retry` / `circuit_breaker` / `rate_limiter` / `cursor` / `attach_heartbeat` and `acknowledge_external_fencing` / `acknowledge_data_loss_and_duplicates`. The latter two ack flags mirror `init()` semantics — `addGroup` never silently enables automatic write failover or write buffering; the caller must explicitly opt in.
+
+**Safety guarantees**:
+
+- **Duplicate-name refusal**: `addDataSource` / `addGroup` return `ConfigError` on existing names — they **never overwrite** the existing pool (same non-destructive semantics as `init`).
+- **Reference integrity**: `removeDataSource` refuses to unregister a leaf referenced by a group; the error message clearly identifies the conflicting group. You must `removeGroup` first, then `removeDataSource`.
+- **All network I/O happens outside the lock**: validation, insertion, and teardown happen inside the `mtx_` critical section; pool construction and `WriteBuffer::start()` are kicked off outside the lock — never hold the lock while doing I/O.
+- **`addDataSource` does not replace — it appends**: a failed concurrent insert shuts down the just-built pool with grace=0 to avoid leaks; the existing pool is untouched.
+- **Grace period**: the grace parameter of `removeDataSource` / `removeGroup` follows the same semantics as `shutdown` — wait for in-flight connections to return, force-close on timeout. `grace=0` returns immediately (the pool is marked closed) — useful for "I want to take it down but don't want to wait".
+
+```cpp
+dbmw::DBMW::init("datasources.json");                  // startup snapshot
+
+dbmw::core::DataSourceOptions leafOpts;
+dbmw::DBMW::addDataSource(cfg, leafOpts);              // add a pool at runtime
+
+dbmw::core::GroupOptions grpOpts;
+grpOpts.acknowledge_external_fencing = true;          // mandatory: explicit opt-in for write failover
+dbmw::DBMW::addGroup(grp, grpOpts);                    // wire a read-write group at runtime
+
+dbmw::DBMW::removeGroup("legacy_grp");                 // remove the group first
+dbmw::DBMW::removeDataSource("legacy_leaf");           // then remove the leaf
+```
+
+Concurrency safety is provided by `mtx_` — multiple threads calling `addDataSource` with different names do not interfere; concurrent same-name calls let the later caller fail gracefully with `ConfigError` — **neither caller** believes it succeeded. See `tests/dbmw_dynamic_test.cpp` for the full concurrent-behavior matrix (79 assertions across 16 scenarios covering add/remove/group/ack/concurrency/grace).
+
 ## Async API (v0.2.0: callbacks / futures / coroutines)
 
 The three calling styles share one execution pipeline — governance gates (audit / rate limit / circuit breaker / cache), retry backoff, statement timeout, cancellation — and differ only in how results are delivered. Enable `async` in the config:

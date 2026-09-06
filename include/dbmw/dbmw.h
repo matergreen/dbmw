@@ -147,6 +147,35 @@ namespace dbmw
 
         // 清空所有已注册拦截器。建议在测试间调用，避免跨用例泄漏。
         static void clearInterceptors();
+
+        // -------------------------------------------------------------------
+        // v0.4.0 M4：运行时动态增删数据源与组。
+        //
+        // 与 init() 共享同一把锁，但网络 IO 全在锁外完成；并发调用会
+        // 自动串行化。重名 / 引用完整性校验失败时返回 ConfigError。
+        // -------------------------------------------------------------------
+
+        // 透传到 DatabaseManager::addDataSource。
+        static common::Status addDataSource(
+            const config::DataSourceConfig &cfg,
+            const core::DataSourceOptions &opts = core::DataSourceOptions{});
+
+        // 透传到 DatabaseManager::removeDataSource。
+        //
+        // grace 默认 5s（与 shutdown 一致）；调用方应等待在途请求归还。
+        static common::Status removeDataSource(
+            const std::string &name,
+            std::chrono::milliseconds grace = std::chrono::milliseconds(5000));
+
+        // 透传到 DatabaseManager::addGroup。
+        static common::Status addGroup(
+            const config::DataSourceGroupConfig &cfg,
+            const core::GroupOptions &opts = core::GroupOptions{});
+
+        // 透传到 DatabaseManager::removeGroup。
+        static common::Status removeGroup(
+            const std::string &name,
+            std::chrono::milliseconds grace = std::chrono::milliseconds(5000));
     };
 } // namespace dbmw
 

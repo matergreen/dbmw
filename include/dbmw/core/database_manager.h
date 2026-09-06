@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 
@@ -331,6 +332,41 @@ namespace dbmw {
     // 已下沉到 common/connection_pool_stats.h（M3 解除循环 include），
     // 此处保留同名别名，所有旧调用方零改动。
     using NamedPoolStats = common::NamedPoolStats;
+
+    // v0.4.0 M4 公开 API 配套结构体：放在 namespace core 顶层而非嵌套在
+    // DatabaseManager 内——C++17 规则下嵌套类成员若带 default initializer，
+    // 外层类方法的默认实参里取不到它（编译报 "needed within definition of
+    // enclosing class ... outside of member functions"）。独立顶层定义既避开
+    // 这一限制，又便于 DBMW facade 透传。
+    struct DataSourceOptions {
+        config::RetryConfig retry = {};
+        config::CircuitBreakerConfig circuit_breaker = {};
+        // 不直接接收 RateLimitConfig，而是允许调用方预建一个 RateLimiter
+        // （也可传 nullptr）。这样复用既有 createRateLimiter 入口，
+        // 并保证每个数据源独立令牌桶；如不传，按 "global_qps<=0 即不限" 创建。
+        std::shared_ptr<RateLimiter> rate_limiter = nullptr;
+        // 单数据源自身不带只读标志——只读是组级约束，默认关闭。
+        bool read_only = false;
+        // 游标能力开关与上限（max_open_cursors 等）。
+        config::CursorConfig cursor = {};
+        // 是否把本次新增的池挂到现有 heartbeat（默认 true；多套 heartbeat
+        // 隔离场景下可置 false，调用方需自管该池的健康检查）。
+        bool attach_heartbeat = true;
+    };
+
+    // 运行时注册单个读写组（构造是纯内存，不做 IO）。
+    //
+    // addGroup 接受原 cfg + 少量额外选项（限流器、游标开关等）——
+    // 因为 DataSourceGroupConfig 本身不携带 retry/circuit_breaker/cursor
+    // 等字段（这些在 init() 中由 GlobalConfig 一并下发）。
+    struct GroupOptions {
+        std::shared_ptr<RateLimiter> rate_limiter = nullptr;
+        config::CursorConfig cursor = {};
+        // ack 风险信号在此处逐项确认——init() 是在循环里读 cfg 校验，
+        // addGroup 只能由调用方就每个 flag 显式表态。
+        bool acknowledge_external_fencing = false;
+        bool acknowledge_data_loss_and_duplicates = false;
+    };
 
     // 面向应用的单数据源句柄：内部从连接池借连接执行（RAII）。
     //
@@ -653,6 +689,43 @@ namespace dbmw {
 
         std::shared_ptr<DataSource> getDefault();
 
+        // -------------------------------------------------------------------
+        // v0.4.0 M4：运行时动态增删数据源与组（与 init() 共享同一把 mtx_，
+        // 但网络 IO 全部在锁外完成）。
+        //   - addDataSource / addGroup 在重名 / 引用完整性校验失败时返回
+        //     ConfigError，**不做**"覆盖式"修改语义（旧池仍服务在途请求）。
+        //   - removeDataSource 拒绝注销"已被组引用"的叶子（返回 ConfigError
+        //     并指明冲突的组名）。先 removeGroup 再 removeDataSource 即可。
+        //   - 与 init() 同时调用未定义：本实现里两者会通过 mtx_ 串行化执行
+        //     （不持锁做 IO），但调用方应避免在 reload() 进行中触发增删
+        //     ——写容器期间被穿插的增删可能会让 reload 的"oldWriteBuffers"
+        //     集合错过刚加进来的缓冲。
+        // -------------------------------------------------------------------
+
+        // 运行时注册单个数据源（建池 + 启动心跳 + 插入 DataSource）。
+        //   - DataSourceOptions / GroupOptions 定义在 namespace core 顶层（见上），
+        //     不放在本类内——嵌套 default initializer 不能作外层方法的默认实参
+        //     （C++17 限制）。
+        common::Status addDataSource(const config::DataSourceConfig &cfg,
+                                     const DataSourceOptions &opts = DataSourceOptions{});
+
+        // 运行时注销单个数据源。
+        //
+        // grace 为等待在途连接归还的宽限期，超期未归还的连接被强制关闭
+        // （与 shutdown 的 grace 语义一致）。返回 ConfigError 表示不存在
+        // 或被组引用。**不会**自动停掉引用它的组——按上述顺序先 removeGroup。
+        common::Status removeDataSource(const std::string &name,
+                                        std::chrono::milliseconds grace =
+                                            std::chrono::milliseconds(5000));
+
+        // 运行时注册单个读写组（构造是纯内存，不做 IO）。
+        common::Status addGroup(const config::DataSourceGroupConfig &cfg,
+                                const GroupOptions &opts = GroupOptions{});
+
+        common::Status removeGroup(const std::string &name,
+                                   std::chrono::milliseconds grace =
+                                       std::chrono::milliseconds(5000));
+
         // 关闭所有连接池与心跳；grace 为等待借用中连接归还的宽限期。
         void shutdown(std::chrono::milliseconds grace = std::chrono::milliseconds(5000));
 
@@ -661,6 +734,53 @@ namespace dbmw {
         std::vector<NamedPoolStats> allPoolStats() const;
 
     private:
+        // -------------------------------------------------------------------
+        // 私有助手（v0.4.0 M4 抽出，供 init / addDataSource 复用）
+        // -------------------------------------------------------------------
+
+        // 校验 cfg 中 primary / replicas / failover.primaries 引用的名字都在
+        // 候选池（pools）里。返回 ConfigError 指明未找到的具体名字，便于运维定位。
+        [[nodiscard]] common::Status validateGroupRefs(
+            const config::DataSourceGroupConfig &cfg,
+            const std::unordered_map<std::string, std::shared_ptr<ConnectionPool> > &candidates,
+            const std::unordered_set<std::string> &replicaNames) const;
+
+        // 校验"某叶子数据源当前没被任何组引用"。
+        // 用于 removeDataSource：返回第一个引用它的组名。
+        // 当前被 inline friend 扫描替代，保留空实现以保持头文件 friend 声明。
+        [[nodiscard]] common::Status checkLeafNotInUse_Unused(
+            const std::string &leafName) const;
+
+        // 共享的"建池 + 建叶子 DataSource"流程，结果写到 out。replicaNames 决定
+        // 该叶子是不是读副本（cache_on_replica_only 下影响缓存资格）。
+        [[nodiscard]] common::Status buildSingleDataSource(
+            const config::DataSourceConfig &dsc,
+            const config::PoolConfig &poolCfg,
+            const config::RetryConfig &retry,
+            const config::CircuitBreakerConfig &circuit,
+            const config::CursorConfig &cursor,
+            std::shared_ptr<RateLimiter> rateLimiter,
+            const std::unordered_set<std::string> &replicaNames,
+            bool attachHeartbeat,
+            std::shared_ptr<ConnectionPool> &outPool,
+            std::shared_ptr<DataSource> &outSource);
+
+        // 共享的"建组 DataSource"流程：纯内存，可放锁内调用。
+        //
+        // 引用 lookup sources（DataSource 映射）：主/副本必须能从 sources 找到对应
+        // DataSource（叶子 DataSource 的池也对应同一个名字）。init 阶段该 map 是
+        // 构建顺序里的"先建好的叶子"快照；addGroup 阶段则直接是 datasources_ 的
+        // 当前视图。replicaNames 同样从 sources 派生（叶子在另一组作副本时也是
+        // 读副本——这里借 init 同样的策略，由调用方一次性计算后传入）。
+        [[nodiscard]] common::Status buildSingleDataSourceGroup(
+            const config::DataSourceGroupConfig &group,
+            const config::PoolConfig &poolCfg,
+            const GroupOptions &opts,
+            const std::unordered_map<std::string, std::shared_ptr<DataSource> > &sources,
+            const std::unordered_set<std::string> &replicaNames,
+            std::vector<std::shared_ptr<WriteBuffer> > &outBuffers,
+            std::shared_ptr<DataSource> &outSource);
+
         mutable std::mutex mtx_;
         std::unordered_map<std::string, std::shared_ptr<ConnectionPool> > pools_;
         std::unordered_map<std::string, std::shared_ptr<DataSource> > datasources_;
