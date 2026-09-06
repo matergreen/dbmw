@@ -35,6 +35,7 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <variant>
 
@@ -344,16 +345,13 @@ static void M8_4_async_wirt_in_entryctx() {
 // ===========================================================================
 static void M8_5_config_loader_warns_on_replica_zero_window() {
     g_scenario = "M8.5";
-    std::cout << "== M8.5 config_loader 副本 + 零窗口：fprintf(stderr, ...) 必须出现 ==\n";
+    std::cout << "== M8.5 config_loader 副本 + 零窗口：stderr WARN 必须出现 ==\n";
 
-    // 重定向 stderr 到临时文件，捕获后再读。
-    const auto errPath = (std::filesystem::temp_directory_path() /
-                          "dbmw_m8_stderr.txt").string();
-    std::ofstream devnull("/dev/null");
-    // 用 freopen 把 stderr 重定向到 errPath
-    std::freopen(errPath.c_str(), "w", stderr);
-    // 同时把 stdout 静默（不希望 noise）
-    std::freopen("/dev/null", "w", stdout);
+    // 只替换 C++ stderr 流缓冲区，避免 freopen 破坏进程级 FILE* 状态。
+    // /dev/null、/dev/tty 在 Windows 上不存在，MSVC CRT 可能因无效恢复
+    // 直接以 0xc0000409 终止测试进程。
+    std::ostringstream capturedStderr;
+    auto *const originalStderr = std::cerr.rdbuf(capturedStderr.rdbuf());
 
     const auto path = (std::filesystem::temp_directory_path() /
                        "dbmw_m8_cfg_warn.json").string();
@@ -378,24 +376,18 @@ static void M8_5_config_loader_warns_on_replica_zero_window() {
     config::GlobalConfig cfg;
     std::string err;
     const bool ok = config::ConfigLoader::loadFromFile(path, cfg, err);
-    // 先把 stderr/stdout 还原——这样 check() 还能正常打到终端
-    std::fflush(stderr);
-    std::freopen("/dev/tty", "w", stderr);
-    std::freopen("/dev/tty", "w", stdout);
+    std::cerr.rdbuf(originalStderr);
 
     check(ok, "ConfigLoader: load ok");
     check(err.empty(), "ConfigLoader: no error");
 
-    std::ifstream errFile(errPath);
-    std::string captured((std::istreambuf_iterator<char>(errFile)),
-                          std::istreambuf_iterator<char>());
+    const std::string captured = capturedStderr.str();
     const bool sawWarn = captured.find("read_after_write_ms=0") != std::string::npos
                       && captured.find("replica") != std::string::npos
                       && captured.find("stale data") != std::string::npos;
     check(sawWarn,
           "M8.5 stderr 输出含 'read_after_write_ms=0 / replica / stale data' 提示");
 
-    std::remove(errPath.c_str());
     std::remove(path.c_str());
     uninstallAllMock();
 }

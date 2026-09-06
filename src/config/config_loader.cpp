@@ -1,8 +1,7 @@
 #include "dbmw/config/config_loader.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
-#include <cstdio>
-#include <cstdlib>
+#include <iostream>
 #include <utility>
 
 
@@ -465,17 +464,17 @@ namespace dbmw::config {
                 group.read_only = g.value("read_only", false);
                 // M8（§10.2 改动 A）：副本 + 零窗口=陈旧读风险。仅打 WARN，
                 // 不阻断 load——既有行为不变（默认值 0 维持），但引导用户修正。
-                // 这里使用 fprintf；DBMW_LOG_* 抽象在 ConfigLoader 下面会成
+                // 这里使用 std::cerr；DBMW_LOG_* 抽象在 ConfigLoader 下面会成
                 // 循环依赖（config 依赖 core，core 依赖 common→logger）。
                 // logger 的等价路径是 DBMW_LOG_WARN（INFO 也可），但那是 InfoLog 风格宏。
                 if (!group.replicas.empty() && group.read_after_write_ms == 0) {
-                    std::fprintf(stderr,
-                        "dbmw WARN: datasource group '%s' has %zu replica(s) but "
-                        "read_after_write_ms=0; writes-then-reads may be served by "
-                        "replicas and return stale data. "
-                        "Set read_after_write_ms > 0 (e.g. 1000) to pin post-write "
-                        "reads to the primary.\n",
-                        group.name.c_str(), group.replicas.size());
+                    std::cerr
+                        << "dbmw WARN: datasource group '" << group.name << "' has "
+                        << group.replicas.size() << " replica(s) but "
+                        << "read_after_write_ms=0; writes-then-reads may be served by "
+                        << "replicas and return stale data. "
+                        << "Set read_after_write_ms > 0 (e.g. 1000) to pin post-write "
+                        << "reads to the primary.\n";
                 }
                 if (g.contains("failover") && !g["failover"].is_object()) {
                     error = "group '" + group.name + "' failover must be an object";
