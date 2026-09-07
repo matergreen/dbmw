@@ -244,7 +244,14 @@ namespace dbmw::common {
         // 异步执行器的有界队列已满，操作被快速拒绝（显式背压信号，可重试）。
         // 追加在枚举末尾是项目既有约定：不得在中间插入值，否则已序列化的
         // 数值会整体漂移（见 observer.h 的同类说明）。
-        Overloaded
+        Overloaded,
+        // 结果集与实体映射声明不匹配（v0.5.0 映射层）：类型不符、NULL 落进
+        // 非 optional 目标、声明的列在结果集中缺失等。
+        //
+        // 与 QueryError 的区别：QueryError = 数据库侧失败；MappingError =
+        // **调用方声明与 SQL 结果不一致**，属于可修复的程序错误，运维侧需要
+        // 能单独分类与告警。见 docs/mapping-design-v0.5.0.md §6.2。
+        MappingError
     };
 
     // 错误码 -> 稳定字符串（便于日志与跨语言边界传递）。

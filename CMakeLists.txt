@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(dbmw VERSION 0.4.0 LANGUAGES CXX)
+project(dbmw VERSION 0.5.0 LANGUAGES CXX)
 
 # 生成 compile_commands.json，便于 CLion/clangd/VS Code 正确解析
 # 工程的 include 路径与编译选项（消除“找不到头文件”类误报）。

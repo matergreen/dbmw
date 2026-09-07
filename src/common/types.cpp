@@ -40,6 +40,7 @@ namespace dbmw::common {
             case ErrorCode::CursorError:      return "CursorError";
             case ErrorCode::Unknown:         break;
             case ErrorCode::Overloaded:      return "Overloaded";
+            case ErrorCode::MappingError:    return "MappingError";
         }
         return "Unknown";
     }

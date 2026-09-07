@@ -8,6 +8,16 @@ target_link_libraries(dbmw_core_test PRIVATE dbmw)
 add_executable(dbmw_async_test dbmw_async_test.cpp)
 target_link_libraries(dbmw_async_test PRIVATE dbmw)
 
+# v0.5.0 实体映射层行为测试：RowMapper 手写声明 + 严格转换矩阵 + 读写双向 +
+# 缓存/脱敏顺序 + 同步/异步/协程三形态（设计 §10 的 M1–M23）。
+# 协程段包含 dbmw/async/task.h（头文件模板），需要 C++20，故 coro=ON 时提标。
+add_executable(dbmw_mapping_test dbmw_mapping_test.cpp)
+target_link_libraries(dbmw_mapping_test PRIVATE dbmw)
+if(DBMW_ENABLE_ASYNC_CORO)
+    set_target_properties(dbmw_mapping_test PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+endif()
+
 # M1 SPI 上下文层单测：SqlContext / ContextScope / W3C traceparent 解析、
 # nextSpanId 行为、LIFO 不变量、线程局部性。无第三方依赖。
 add_executable(dbmw_context_test dbmw_context_test.cpp)
@@ -107,6 +117,7 @@ find_package(Threads QUIET)
 if(Threads_FOUND)
     target_link_libraries(dbmw_core_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_async_test PRIVATE Threads::Threads)
+    target_link_libraries(dbmw_mapping_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_interceptor_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_observability_test PRIVATE Threads::Threads)
     target_link_libraries(dbmw_exporters_test PRIVATE Threads::Threads)
@@ -132,6 +143,7 @@ endif()
 
 add_test(NAME dbmw_core_test COMMAND dbmw_core_test)
 add_test(NAME dbmw_async_test COMMAND dbmw_async_test)
+add_test(NAME dbmw_mapping_test COMMAND dbmw_mapping_test)
 add_test(NAME dbmw_context_test COMMAND dbmw_context_test)
 add_test(NAME dbmw_interceptor_test COMMAND dbmw_interceptor_test)
 add_test(NAME dbmw_observability_test COMMAND dbmw_observability_test)
