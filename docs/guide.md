@@ -62,9 +62,11 @@ include/dbmw/
              mysql_driver.h  postgres_driver.h  odbc_driver.h
   async/     async_types.h(结果体/Handle)  executor.h(IExecutor/线程池)
              dbmw_async.h(异步门面)  task.h(协程层，可选 C++20)
+  mapping.h  (实体映射层 v0.5.0：header-only，Row ↔ 业务实体，读写双向)
   dbmw.h     (对外门面)
 src/         对应实现
 tests/       dbmw_core_test.cpp  dbmw_async_test.cpp  dbmw_coro_test.cpp(coro=ON)
+             dbmw_mapping_test.cpp(实体映射)
 examples/    basic_usage.cpp  async_example.cpp
 config/      datasources.json.example
 third_party/nlohmann/json.hpp  (vendored 单头，离线可用)
@@ -929,6 +931,92 @@ dbmw::async::run(demo());   // 受控 fire-and-forget：跑完自毁，不悬垂
 - 协程体不要用捕获局部引用的 lambda——闭包临时对象先于异步完成销毁，捕获会悬垂；用具名函数返回 `Task`。
 - GCC 13 已知缺陷：`co_await` 实参中直接写非平凡花括号临时（如 `{Value(1)}`）会触发编译器 ICE（PR109227 系）；参数先具名构造再传入即可规避，GCC 14+ / Clang / MSVC 不受影响。
 - 完整设计（含排水顺序、超时判定与一致性测试矩阵）见 `docs/async-design-v0.2.0.md`。
+
+## 实体映射（v0.5.0：Row ↔ 业务实体，读写双向）
+
+`include/dbmw/mapping.h` 是 **header-only** 的适配层：把 `ResultSet` 的行按**业务手写的字段声明**搬进/搬出业务结构体。它不是 ORM——SQL 仍由业务书写、没有脏跟踪与延迟加载、`dbmw.h` 与引擎核心**零改动**。与 v0.4.0 非目标的关系见 `docs/roadmap-design-v0.4.0.md` §1.2 的 v0.5.0 修订说明。
+
+### 一次声明
+
+```cpp
+#include "dbmw/mapping.h"
+
+struct User {
+    std::int64_t id;
+    std::string  name;
+    std::optional<std::string> email;   // optional 自动接 SQL NULL
+    dbmw::common::Decimal balance;      // 高精度原样保留，不转 double
+    std::int64_t created_at;
+};
+
+template <> struct dbmw::mapping::RowMapper<User> {
+    static auto describe() {
+        return dbmw::mapping::Mapping<User>()
+            .field(&User::id,         "id")
+            .field(&User::name,       "name")
+            .field(&User::email,      "email")
+            .field(&User::balance,    "balance")
+            .field(&User::created_at, "created_at",
+                   dbmw::mapping::FieldFlags::PrimaryKey);
+    }
+};
+```
+
+### 读
+
+```cpp
+auto r = dbmw::queryAs<User>("SELECT id,name,email,balance,created_at FROM users WHERE age > ?",
+                             {dbmw::common::Value(std::int64_t(18))});
+if (r.status.ok()) for (auto &u : r.items) use(u);      // r.items：std::vector<User>
+
+auto one = dbmw::queryOneAs<User>("SELECT * FROM users WHERE id = ?",
+                                  {dbmw::common::Value(std::int64_t(1))});
+// one.value：std::optional<User>；**多于一行是错误**，不静默取第一行
+
+dbmw::queryEachAs<User>("SELECT * FROM users", [](User &&u) { use(u); return true; });
+```
+
+游标与事务内同样可用：`dbmw::fetchAs<T>(cursor)`、`dbmw::queryAs<T>(session, sql)`。
+
+### 写
+
+```cpp
+User u{0, "alice", "a@x.com", dbmw::common::Decimal{"12.50"}, now()};
+
+auto p = dbmw::paramsOf(u);                       // 实体 → Params（跳过 Generated/ReadOnly 列）
+auto ins = dbmw::insertSql<User>("users");        // "INSERT INTO `users` (...) VALUES (?, ...)"
+auto upd = dbmw::updateSql<User>("users");        // "UPDATE `users` SET ... WHERE `id` = ?"
+
+auto k = dbmw::insertAs(u, "users");              // 执行 + 生成键回填到主键字段
+auto n = dbmw::updateAs(u, "users");              // 按 PrimaryKey 定位
+auto b = dbmw::insertBatchAs(std::vector<User>{...}, "users");
+```
+
+生成键回填走「列名匹配 + `lastInsertId()` 兜底」双路——MySQL 合成列名固定为 `insert_id`，PG/ODBC 的 `RETURNING` 按列名匹配。
+
+### 宽松 / 严格（缺列可配，类型不符与 NULL 始终报错）
+
+类型不符、NULL 落到非 `optional` 成员**直接报错**（`ErrorCode::MappingError`），不填默认值、不返回半成品；缺列与多余列默认宽松、可逐项收紧：
+
+| 情形 | 默认行为 | 收紧方式 |
+|---|---|---|
+| 声明列在结果集中缺失 | **跳过**该字段（保持默认构造值） | `.missingColumns(MissingColumns::Error)` |
+| 结果集有未声明的多余列 | **忽略**（兼容 `SELECT *`） | `.extraColumns(ExtraColumns::Error)` |
+| NULL 落到非 `optional` 成员 | 报错 | — |
+| `int64 → int32` 等收窄 | 范围检查，溢出报错 | — |
+| `Decimal → double`、`Blob → string` 等有损/文本转换 | 默认拒绝 | 显式声明 `FieldFlags::Lossy` / `Textual` |
+| `queryOneAs` 命中多行 | 报错 | — |
+
+> 缺列与 NULL 是两回事：前者跳过、后者报错。实现上判断缺列必须用 `row.data().find()`，
+> 不能用 `Row::at()`——`at()` 对缺失列返回静态 NULL，会把「SQL 少查一列」伪装成「这列是 NULL」。
+
+### 与既有能力的边界
+
+- **查询缓存**：只缓存原始 `ResultSet`，命中后再映射——实体从不进缓存。
+- **脱敏**：映射发生在 `afterExecution` 之后，业务实体拿到的是脱敏后的值。
+- **异步**：`dbmw::async::queryAs<T>` 提供回调 / future / 协程三形态，映射跑在**完成投递线程**（默认 worker；注入 asio 时是 `io_context` 线程），因此映射逻辑必须轻量——大结果集走 `queryEachAs` 流式分流。
+
+完整设计（转换矩阵、不变量、M1–M23 测试矩阵）见 `docs/mapping-design-v0.5.0.md`。
 
 ## 可观测性
 

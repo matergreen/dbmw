@@ -123,7 +123,37 @@ auto status = dbmw::DBMW::transaction([](dbmw::core::Session &session) {
 });
 ```
 
-### 5. 运行测试
+### 5. 实体映射（可选）
+
+`dbmw/mapping.h` 是 header-only 适配层，按业务手写的字段声明在 `ResultSet` 与业务结构体之间搬运数据。它不是 ORM——SQL 仍由业务书写，核心引擎零改动：
+
+```cpp
+#include "dbmw/mapping.h"
+
+struct User {
+    std::int64_t id;
+    std::string  name;
+    std::optional<std::string> email;   // 自动接 SQL NULL
+};
+
+template <> struct dbmw::mapping::RowMapper<User> {
+    static auto describe() {
+        return dbmw::mapping::Mapping<User>()
+            .field(&User::id,    "id")
+            .field(&User::name,  "name")
+            .field(&User::email, "email",
+                   dbmw::mapping::FieldFlags::PrimaryKey);
+    }
+};
+
+auto r = dbmw::queryAs<User>("SELECT id, name, email FROM users WHERE id = ?",
+                             {std::int64_t(42)});
+if (r.status.ok() && !r.items.empty()) use(r.items[0]);
+```
+
+类型不符、NULL 落到非 `optional` 成员返回 `MappingError`（不填默认值）；缺列默认跳过、多余列默认忽略，可分别用 `.missingColumns(...)` / `.extraColumns(...)` 收紧。写方向有 `paramsOf` / `insertSql` / `updateSql` / `insertAs` / `updateAs` / `insertBatchAs`，并支持生成键回填。异步侧 `dbmw::async::queryAs<T>` 提供回调 / future / 协程三形态。
+
+### 6. 运行测试
 
 ```bash
 cmake -S . -B build -DDBMW_BUILD_TESTS=ON
@@ -149,4 +179,5 @@ ctest --test-dir build --output-on-failure
 
 连接池、异步 API、游标、故障转移、可观测性、错误码、配置项和驱动扩展等内容见
 [dbmw 详细指南](docs/guide.md)。异步实现设计见
-[异步设计文档](docs/async-design-v0.2.0.md)。
+[异步设计文档](docs/async-design-v0.2.0.md)，实体映射设计见
+[映射设计文档](docs/mapping-design-v0.5.0.md)。

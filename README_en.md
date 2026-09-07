@@ -128,7 +128,43 @@ auto status = dbmw::DBMW::transaction([](dbmw::core::Session &session) {
 });
 ```
 
-### 5. Run tests
+### 5. Entity mapping (optional)
+
+`dbmw/mapping.h` is a header-only adapter layer that moves data between a `ResultSet` and your
+structs, following a field declaration you write by hand. It is not an ORM — SQL stays in your
+code and the engine core is untouched:
+
+```cpp
+#include "dbmw/mapping.h"
+
+struct User {
+    std::int64_t id;
+    std::string  name;
+    std::optional<std::string> email;   // receives SQL NULL
+};
+
+template <> struct dbmw::mapping::RowMapper<User> {
+    static auto describe() {
+        return dbmw::mapping::Mapping<User>()
+            .field(&User::id,    "id")
+            .field(&User::name,  "name")
+            .field(&User::email, "email",
+                   dbmw::mapping::FieldFlags::PrimaryKey);
+    }
+};
+
+auto r = dbmw::queryAs<User>("SELECT id, name, email FROM users WHERE id = ?",
+                             {std::int64_t(42)});
+if (r.status.ok() && !r.items.empty()) use(r.items[0]);
+```
+
+Type mismatches and NULL landing in a non-`optional` member yield `MappingError` (no silent default
+values). Missing columns are skipped by default and extra columns ignored; each can be tightened via
+`.missingColumns(...)` / `.extraColumns(...)`. The write direction offers `paramsOf` / `insertSql` /
+`updateSql` / `insertAs` / `updateAs` / `insertBatchAs`, including generated-key back-fill. On the
+async side, `dbmw::async::queryAs<T>` comes in callback / future / coroutine form.
+
+### 6. Run tests
 
 ```bash
 cmake -S . -B build -DDBMW_BUILD_TESTS=ON
@@ -155,4 +191,5 @@ ctest --test-dir build --output-on-failure
 
 See the [dbmw detailed guide](docs/guide_en.md) for connection pooling, asynchronous APIs,
 cursors, failover, observability, error codes, configuration, and driver extensions. See the
-[asynchronous design document](docs/async-design-v0.2.0.md) for implementation details.
+[asynchronous design document](docs/async-design-v0.2.0.md) for implementation details, and the
+[mapping design document](docs/mapping-design-v0.5.0.md) for entity mapping.

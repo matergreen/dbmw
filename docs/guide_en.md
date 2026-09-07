@@ -59,9 +59,11 @@ include/dbmw/
              mysql_driver.h  postgres_driver.h  odbc_driver.h
   async/     async_types.h(results/Handle)  executor.h(IExecutor/thread pool)
              dbmw_async.h(async facade)  task.h(coroutine layer, optional C++20)
+  mapping.h  (entity mapping layer v0.5.0: header-only, row <-> business entity, read+write)
   dbmw.h     (public facade)
 src/         corresponding implementations
 tests/       dbmw_core_test.cpp  dbmw_async_test.cpp  dbmw_coro_test.cpp(coro=ON)
+             dbmw_mapping_test.cpp(entity mapping)
 examples/    basic_usage.cpp  async_example.cpp
 config/      datasources.json.example
 third_party/nlohmann/json.hpp  (vendored single-header, works offline)
@@ -885,6 +887,93 @@ Constraints and caveats:
 - Do not write coroutine bodies as lambdas capturing locals — the closure temporary dies before the async operation completes and the captures dangle; use named functions returning `Task`.
 - Known GCC 13 defect: non-trivial braced temporaries directly inside `co_await` arguments (e.g. `{Value(1)}`) trigger an internal compiler error (PR109227 family); hoist parameters into a named local first. GCC 14+ / Clang / MSVC are unaffected.
 - Full design (drain order, timeout semantics, consistency test matrix): `docs/async-design-v0.2.0.md`.
+
+## Entity mapping (v0.5.0: row <-> business entity, read and write)
+
+`include/dbmw/mapping.h` is a **header-only** adapter layer: it moves `ResultSet` rows into/out of business structs following a **field declaration the business writes by hand**. This is not an ORM — SQL stays in business code, there is no dirty tracking or lazy loading, and `dbmw.h` plus the engine core stay **untouched**. See the v0.5.0 revision note in `docs/roadmap-design-v0.4.0.md` §1.2 for how this relates to the earlier non-goal.
+
+### Declare once
+
+```cpp
+#include "dbmw/mapping.h"
+
+struct User {
+    std::int64_t id;
+    std::string  name;
+    std::optional<std::string> email;   // optional receives SQL NULL
+    dbmw::common::Decimal balance;      // high precision preserved, never narrowed to double
+    std::int64_t created_at;
+};
+
+template <> struct dbmw::mapping::RowMapper<User> {
+    static auto describe() {
+        return dbmw::mapping::Mapping<User>()
+            .field(&User::id,         "id")
+            .field(&User::name,       "name")
+            .field(&User::email,      "email")
+            .field(&User::balance,    "balance")
+            .field(&User::created_at, "created_at",
+                   dbmw::mapping::FieldFlags::PrimaryKey);
+    }
+};
+```
+
+### Read
+
+```cpp
+auto r = dbmw::queryAs<User>("SELECT id,name,email,balance,created_at FROM users WHERE age > ?",
+                             {dbmw::common::Value(std::int64_t(18))});
+if (r.status.ok()) for (auto &u : r.items) use(u);      // r.items: std::vector<User>
+
+auto one = dbmw::queryOneAs<User>("SELECT * FROM users WHERE id = ?",
+                                  {dbmw::common::Value(std::int64_t(1))});
+// one.value: std::optional<User>; **more than one row is an error**, not a silent first row
+
+dbmw::queryEachAs<User>("SELECT * FROM users", [](User &&u) { use(u); return true; });
+```
+
+Cursors and in-transaction use work the same way: `dbmw::fetchAs<T>(cursor)`, `dbmw::queryAs<T>(session, sql)`.
+
+### Write
+
+```cpp
+User u{0, "alice", "a@x.com", dbmw::common::Decimal{"12.50"}, now()};
+
+auto p = dbmw::paramsOf(u);                       // entity -> Params (skips Generated/ReadOnly columns)
+auto ins = dbmw::insertSql<User>("users");        // "INSERT INTO `users` (...) VALUES (?, ...)"
+auto upd = dbmw::updateSql<User>("users");        // "UPDATE `users` SET ... WHERE `id` = ?"
+
+auto k = dbmw::insertAs(u, "users");              // executes + back-fills the generated key
+auto n = dbmw::updateAs(u, "users");              // located by PrimaryKey
+auto b = dbmw::insertBatchAs(std::vector<User>{...}, "users");
+```
+
+Generated-key back-fill takes two paths: column-name match plus a `lastInsertId()` fallback — MySQL synthesises the column name `insert_id`, while PG/ODBC `RETURNING` is matched by column name.
+
+### Lenient / strict (missing columns configurable; type mismatch and NULL always error)
+
+A type mismatch or NULL landing in a non-`optional` member is an **error** (`ErrorCode::MappingError`): no default values, no half-built objects. Missing and extra columns are lenient by default and can each be tightened:
+
+| Case | Default behaviour | Tighten with |
+|---|---|---|
+| Declared column missing from the result set | **Skipped** (member keeps its default-constructed value) | `.missingColumns(MissingColumns::Error)` |
+| Undeclared extra column in the result set | **Ignored** (keeps `SELECT *` working) | `.extraColumns(ExtraColumns::Error)` |
+| NULL into a non-`optional` member | Error | — |
+| Narrowing such as `int64 -> int32` | Range-checked; overflow is an error | — |
+| Lossy/textual conversions (`Decimal -> double`, `Blob -> string`) | Rejected by default | explicit `FieldFlags::Lossy` / `Textual` |
+| `queryOneAs` matched more than one row | Error | — |
+
+> A missing column is not the same as NULL: the former is skipped, the latter errors. The implementation must
+> test presence with `row.data().find()`, never `Row::at()` — `at()` returns a static NULL for a missing column,
+> disguising "you forgot to SELECT this column" as "this column is NULL".
+
+### Boundaries with existing features
+
+- **Query cache**: only the raw `ResultSet` is cached, mapping runs after a hit — entities never enter the cache.
+- **Redaction**: mapping happens after `afterExecution`, so entities see redacted values.
+- **Async**: `dbmw::async::queryAs<T>` ships in callback / future / coroutine form; mapping runs on the **completion-delivery thread** (a worker by default, the `io_context` thread when asio is injected), so mapping must stay cheap — use streaming `queryEachAs` for large result sets.
+
+Full design (conversion matrix, invariants, M1–M23 test matrix) lives in `docs/mapping-design-v0.5.0.md`.
 
 ## Observability
 

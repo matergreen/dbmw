@@ -13,7 +13,7 @@
 |---|---|
 | 做什么 | **结果集 ↔ 业务实体的适配层**（行→对象 / 对象→绑定参数），**不是 ORM** |
 | 形态 | 单头文件 `include/dbmw/mapping.h`，header-only、全模板、手写特化、零引擎改动 |
-| 严格性 | **一切不符即报错**：类型不符、NULL 落非 `optional`、缺列 → 失败；不静默填默认值 |
+| 严格性 | **类型不符、NULL 落非 `optional` 即报错**；**缺列默认跳过**（字段保持默认值），可 `.missingColumns(MissingColumns::Error)` 收紧；多余列默认忽略，可 `.extraColumns(ExtraColumns::Error)` 收紧 |
 | 方向 | **读写双向**：读 = `ResultSet/Row → T`；写 = `T → Params`（含批量与生成键回填） |
 | 范围 | 同步 + 异步（回调 / future）+ 协程**一次做完**；游标与事务内 `Session` 一并覆盖 |
 | 归属 | 独立头文件，不修改任何既有签名（遵守 §1.1「头文件即 ABI」） |
@@ -338,14 +338,17 @@ template <class T> Task<EntityResult<T>> queryAsAsync(std::string sql,
 
 ---
 
-## 5. 类型转换规则（严格模式）
+## 5. 类型转换规则
 
 ### 5.1 默认策略
 
 1. **精确匹配优先**：源 `Value` 的 alternative 与目标类型语义一致才通过；
 2. **无隐式放宽**：不做数值提升（除整型间带范围检查）、不做文本↔数值猜测、不做 `Decimal → double`；
-3. **失败即 `MappingError`**：不填默认值、不吞掉、不跳字段；
+3. **类型不符即 `MappingError`**：不填默认值、不吞掉、不跳字段；
 4. 唯一例外由字段显式声明：`Lossy` / `Textual`（§4.1）。
+
+> **v0.5.0 修订（用户决策）**：§5.5 的「缺列」行为从「报错」放宽为「**默认跳过**」。类型不符与
+> NULL 落非 `optional` 仍保持报错（这两类静默填值最难排查）。
 
 ### 5.2 转换矩阵（读方向：`Value → U`）
 
@@ -382,12 +385,13 @@ template <class T> Task<EntityResult<T>> queryAsAsync(std::string sql,
 
 | 情形 | 默认行为 | 可配 |
 |---|---|---|
-| 声明的列在结果集中缺失 | **报错** `MappingError`（SQL 漏字段不该静默） | 无（严格模式，用户已决策） |
+| 声明的列在结果集中缺失 | **跳过**该字段（保持默认构造值），正常返回 | `Mapping<T>::missingColumns(MissingColumns::Error)` 切为报错 |
 | 结果集有声明外的列 | 忽略（兼容 `SELECT *`、联表） | `Mapping<T>::extraColumns(ExtraColumns::Error)` 切为报错 |
 | 重名列 | 沿用 `Row` 既有语义（后者覆盖前者），文档提示用别名 | — |
 | `SELECT` 顺序 | 不依赖：`Row` 是 map，按列名取 | — |
 
-> **实现要点（来自 C2）**：判断缺列必须用 `row.data().find(name)`，**不能**用 `at()`——后者对缺失列返回静态 NULL，会把"SQL 少查了一列"伪装成"这列是 NULL"，与严格模式直接冲突。
+> **实现要点（来自 C2）**：判断缺列必须用 `row.data().find(name)`，**不能**用 `at()`——后者对缺失列
+> 返回静态 NULL，会把"SQL 少查了一列"伪装成"这列是 NULL"；缺列与 NULL 是两回事（前者跳过、后者仍报错）。
 
 ---
 
@@ -466,7 +470,7 @@ mapping: Order.qty: value 4294967296 out of range for int32_t [row=7]
 | M1 | 基本映射：5 列全类型 | `items` 与原始行逐字段相等 |
 | M2 | `optional` 接收 NULL / 非 NULL | `nullopt` / 有值 |
 | M3 | NULL 落非 optional | `MappingError`，消息含列名 |
-| M4 | 缺列（SQL 少查一列） | `MappingError`（**关键**：验证用 `find` 而非 `at`，见 §5.5） |
+| M4 | 缺列（SQL 少查一列） | 默认跳过、字段保持默认值；`MissingColumns::Error` 下 `MappingError`（**关键**：验证用 `find` 而非 `at`，见 §5.5） |
 | M5 | 多余列 | 默认忽略；`ExtraColumns::Error` 下报错 |
 | M6 | 类型不符矩阵 | 逐组合断言报错：`bool←int64`、`int32←overflow`、`double←Decimal`、`string←Blob`、`Timestamp←string`（无 Textual）等 |
 | M7 | `Lossy` / `Textual` 字段声明 | 声明后放行，未声明报错 |
@@ -496,7 +500,7 @@ mapping: Order.qty: value 4294967296 out of range for int32_t [row=7]
 | # | 风险 | 等级 | 应对 |
 |---|---|---|---|
 | R1 | 被误用为 ORM（业务开始期待关联加载/自动 SQL） | 中 | 文档首屏与 `guide.md` 非目标章节显式划界；不提供任何元数据驱动能力 |
-| R2 | 缺列被 `at()` 的静态 NULL 掩盖 → 严格模式失效 | 高 | 强制 `data().find()`（§5.5）；M4 专项用例 |
+| R2 | 缺列被 `at()` 的静态 NULL 掩盖 → 缺列与 NULL 混淆 | 高 | 强制 `data().find()`（§5.5）；M4 专项用例 |
 | R3 | 异步大结果集映射阻塞完成投递线程（asio 单线程场景） | 中 | I7 文档约束 + 流式 `queryEachAs` 分流；必要时后续评估 D3-B |
 | R4 | 模板错误信息难读 | 低 | `static_assert` 友好提示（§4.1）；`ValueConverter` 未特化时给明确提示 |
 | R5 | 严格模式抬高存量代码迁移成本（老代码有大量隐式转换假设） | 中 | 迁移期可用 `Lossy` / `Textual` 逐字段放开；错误信息精确给出列名与目标类型 |
@@ -618,3 +622,31 @@ template <> struct ValueConverter<UserId> {
 | `ErrorCode` 只能尾部追加（C10） | `MappingError` 追加在 `Overloaded` 之后 |
 | 异步三层同源语义 | 映射层三形态均为既有 API 薄封装，治理/重试/取消不变 |
 | GCC 13 协程 ICE（C12） | 协程示例与测试一律用具名局部变量传参 |
+
+---
+
+## 14. 实施状态（v0.5.0 已落地）
+
+| 里程碑 | 内容 | 状态 |
+|---|---|---|
+| M1 | `mapping.h` 声明层 + `ValueConverter` 读方向 + 同步 `queryAs/queryOneAs/queryEachAs` + `MappingError` | ✅ |
+| M2 | 写方向 `paramsOf/batchOf/insertSql/updateSql/insertAs/updateAs/insertBatchAs` + 生成键回填 | ✅ |
+| M3 | 异步三形态（回调 / future / 协程）+ 游标 `fetchAs<T>` + 事务内 `queryAs<T>(Session&)` | ✅ |
+| M4 | 文档（roadmap §1.2 修订、guide×2、README×2）+ 版本号 + 全量回归 | ✅ |
+
+**回归结果**（本地 MinGW GCC 15）：
+
+| 构建形态 | 结果 |
+|---|---|
+| `DBMW_ENABLE_ASYNC_CORO=ON` | ctest 14/14 通过（`dbmw_mapping_test` 83/83，含 M20–M22 协程段） |
+| `DBMW_ENABLE_ASYNC_CORO=OFF` | ctest 13/13 通过（映射层同步部分全绿，协程段按宏跳过） |
+
+**实施期修正**（与本文正文的偏差，以后者为准）：
+
+1. `queryOneAs` 的多行判定放在 `detail::queryOneAsImpl` 内，五个重载共用（正文 §4.3 只给了概念描述）。
+2. `Mapping<T>` 的 `writable()` 与 `isDeclared()` 均改为 **public**——写方向 SQL 生成与缺列校验需要跨类调用它们。
+3. `updateSql` 的 SET 子句由 `joinIdentifiers(setCols)` 与 `placeholders(setCols.size())` 分别生成后拼接，形如
+   ``UPDATE `t` SET `a` = ?, `b` = ? WHERE `id` = ?``（正文起草时的拼接表达式有误，实现以本条为准）。
+4. **缺列策略放宽（用户决策，覆盖 §0/§5.5）**：新增 `MissingColumns { Ignore, Error }`，默认 `Ignore`——
+   缺列跳过该字段（保持默认构造值）正常返回；`.missingColumns(MissingColumns::Error)` 可拿回严格行为。
+   类型不符与 NULL 落非 `optional` 仍保持报错。`M4` 用例随之更新为「默认跳过 + 显式 Error 报错」两条路径。
